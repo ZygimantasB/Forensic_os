@@ -227,9 +227,9 @@ if [[ -n "$KEYWORD" ]]; then
         for logfile in "${LOG_FILES[@]}"; do
             LINE_NUM=0
             while IFS= read -r line; do
-                (( LINE_NUM++ ))
+                LINE_NUM=$((LINE_NUM + 1))
                 if echo "$line" | grep -qi "$KEYWORD"; then
-                    (( MATCH_COUNT++ ))
+                    MATCH_COUNT=$((MATCH_COUNT + 1))
                     case "$FORMAT" in
                         csv)
                             escaped="${line//\"/\"\"}"
@@ -408,7 +408,6 @@ if [[ -z "$KEYWORD" && "$TIMELINE_MODE" -eq 0 ]]; then
                             echo "    ${cnt}  ${code}"
                         done
                     echo "  Suspicious patterns (SQLi, XSS, traversal):"
-                    local suspicious
                     suspicious="$(read_log "$logfile" 2>/dev/null | \
                         grep -ciE "union.*select|<script|\.\.\/|\/etc\/passwd|cmd\.exe|eval\(" || echo 0)"
                     echo "    ${suspicious} suspicious requests found"
@@ -416,7 +415,6 @@ if [[ -z "$KEYWORD" && "$TIMELINE_MODE" -eq 0 ]]; then
             esac
 
             # Error / warning / failure counts
-            local errs warns fails
             errs="$(read_log "$logfile" 2>/dev/null | grep -ci 'error' || echo 0)"
             warns="$(read_log "$logfile" 2>/dev/null | grep -ci 'warn' || echo 0)"
             fails="$(read_log "$logfile" 2>/dev/null | grep -ci 'fail' || echo 0)"

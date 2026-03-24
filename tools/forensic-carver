@@ -173,9 +173,9 @@ TOTAL_FILES=0
 TOTAL_SIZE=0
 
 while IFS= read -r -d '' carved_file; do
-    (( TOTAL_FILES++ ))
+    TOTAL_FILES=$((TOTAL_FILES + 1))
     fsize="$(stat -c%s "$carved_file" 2>/dev/null || echo 0)"
-    (( TOTAL_SIZE += fsize ))
+    TOTAL_SIZE=$((TOTAL_SIZE + fsize))
     fhash="$(generate_hash "$carved_file" "$HASH_ALGO" 2>/dev/null || echo "ERROR")"
     rel_path="${carved_file#${OUTPUT_DIR}/}"
     printf '  %s  %s  (%s)\n' "$fhash" "$rel_path" "$(format_size "$fsize")" >> "$SUMMARY_FILE"

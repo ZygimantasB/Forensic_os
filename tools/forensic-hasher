@@ -164,7 +164,7 @@ if [[ -n "$TARGET_DIR" ]]; then
     if [[ "$RECURSIVE" -eq 1 ]]; then
         while IFS= read -r -d '' file; do
             compute_hashes "$file" >> "$TMPOUT"
-            (( file_count++ ))
+            file_count=$((file_count + 1))
             if (( file_count % 100 == 0 )); then
                 log_info "  Processed ${file_count} files..."
             fi
@@ -173,7 +173,7 @@ if [[ -n "$TARGET_DIR" ]]; then
         for file in "$TARGET_DIR"/*; do
             [[ -f "$file" ]] || continue
             compute_hashes "$file" >> "$TMPOUT"
-            (( file_count++ ))
+            file_count=$((file_count + 1))
         done
     fi
 

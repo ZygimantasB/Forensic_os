@@ -21,7 +21,7 @@ RED    := \033[0;31m
 CYAN   := \033[0;36m
 NC     := \033[0m
 
-.PHONY: build clean rebuild usb setup help
+.PHONY: build clean rebuild usb setup test lint help
 
 ## Build the Forensic OS ISO image
 build:
@@ -52,6 +52,27 @@ setup:
 	@echo -e "$(CYAN)[*] Setting up development environment...$(NC)"
 	@$(SCRIPTS_DIR)/setup-dev.sh
 
+## Run the test suite
+test:
+	@echo -e "$(CYAN)[*] Running ForensicOS test suite...$(NC)"
+	@bash tests/run-all-tests.sh
+
+## Lint all shell scripts with shellcheck
+lint:
+	@echo -e "$(CYAN)[*] Linting shell scripts...$(NC)"
+	@FAIL=0; \
+	for f in tools/* lib/*.sh ui/forensic-* scripts/*.sh tests/test-*.sh; do \
+		if [ -f "$$f" ] && head -1 "$$f" | grep -q 'bash\|sh'; then \
+			echo "  Checking: $$f"; \
+			shellcheck -x "$$f" 2>/dev/null || FAIL=1; \
+		fi; \
+	done; \
+	if [ $$FAIL -eq 0 ]; then \
+		echo -e "$(GREEN)[*] All scripts pass lint.$(NC)"; \
+	else \
+		echo -e "$(YELLOW)[!] Some scripts have lint warnings.$(NC)"; \
+	fi
+
 ## Show help
 help:
 	@echo ""
@@ -62,6 +83,8 @@ help:
 	@echo -e "  $(GREEN)make clean$(NC)    - Clean the build environment"
 	@echo -e "  $(GREEN)make rebuild$(NC)  - Clean and rebuild from scratch"
 	@echo -e "  $(GREEN)make usb$(NC)      - Write ISO to USB device (interactive)"
+	@echo -e "  $(GREEN)make test$(NC)     - Run the test suite"
+	@echo -e "  $(GREEN)make lint$(NC)     - Lint shell scripts with shellcheck"
 	@echo -e "  $(GREEN)make setup$(NC)    - Install build dependencies"
 	@echo -e "  $(GREEN)make help$(NC)     - Show this help message"
 	@echo ""
