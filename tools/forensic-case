@@ -70,12 +70,19 @@ coc_log() {
     local timestamp
     timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    local entry
-    entry=$(cat <<ENTRY
-{"timestamp":"${timestamp}","action":"${action}","item":"${item}","handler":"${handler}","from":"","to":"","notes":"${notes}"}
-ENTRY
-    )
-    echo "$entry" >> "$coc_file"
+    python3 -c "
+import json, sys
+entry = {
+    'timestamp': sys.argv[1],
+    'action': sys.argv[2],
+    'item': sys.argv[3],
+    'handler': sys.argv[4],
+    'from': '',
+    'to': '',
+    'notes': sys.argv[5]
+}
+print(json.dumps(entry))
+" "$timestamp" "$action" "$item" "$handler" "$notes" >> "$coc_file"
 }
 
 # Initialize a new case
@@ -123,20 +130,23 @@ cmd_init() {
     local created_date
     created_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    cat > "${case_dir}/case.json" <<CASEJSON
-{
-    "case_number": "${case_number}",
-    "examiner": "${examiner}",
-    "created": "${created_date}",
-    "modified": "${created_date}",
-    "description": "${description}",
-    "status": "open",
-    "evidence_items": [],
-    "notes": "",
-    "agency": "",
-    "requesting_officer": ""
+    python3 -c "
+import json, sys
+data = {
+    'case_number': sys.argv[1],
+    'examiner': sys.argv[2],
+    'created': sys.argv[3],
+    'modified': sys.argv[3],
+    'description': sys.argv[4],
+    'status': 'open',
+    'evidence_items': [],
+    'notes': '',
+    'agency': '',
+    'requesting_officer': ''
 }
-CASEJSON
+with open(sys.argv[5], 'w') as f:
+    json.dump(data, f, indent=4)
+" "$case_number" "$examiner" "$created_date" "$description" "${case_dir}/case.json"
 
     log_info "Created case.json"
 
@@ -176,10 +186,10 @@ cmd_status() {
     fi
 
     local examiner created description status
-    examiner=$(python3 -c "import json; print(json.load(open('${case_json}'))['examiner'])" 2>/dev/null || echo "N/A")
-    created=$(python3 -c "import json; print(json.load(open('${case_json}'))['created'])" 2>/dev/null || echo "N/A")
-    description=$(python3 -c "import json; print(json.load(open('${case_json}'))['description'])" 2>/dev/null || echo "N/A")
-    status=$(python3 -c "import json; print(json.load(open('${case_json}'))['status'])" 2>/dev/null || echo "N/A")
+    examiner=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['examiner'])" "$case_json" 2>/dev/null || echo "N/A")
+    created=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['created'])" "$case_json" 2>/dev/null || echo "N/A")
+    description=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['description'])" "$case_json" 2>/dev/null || echo "N/A")
+    status=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['status'])" "$case_json" 2>/dev/null || echo "N/A")
 
     # Count evidence items
     local evidence_count=0
@@ -233,10 +243,10 @@ cmd_list() {
 
         found=1
         local cn ex st desc marker=""
-        cn=$(python3 -c "import json; print(json.load(open('${case_json}'))['case_number'])" 2>/dev/null || echo "???")
-        ex=$(python3 -c "import json; print(json.load(open('${case_json}'))['examiner'])" 2>/dev/null || echo "???")
-        st=$(python3 -c "import json; print(json.load(open('${case_json}'))['status'])" 2>/dev/null || echo "???")
-        desc=$(python3 -c "import json; print(json.load(open('${case_json}'))['description'][:40])" 2>/dev/null || echo "???")
+        cn=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['case_number'])" "$case_json" 2>/dev/null || echo "???")
+        ex=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['examiner'])" "$case_json" 2>/dev/null || echo "???")
+        st=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['status'])" "$case_json" 2>/dev/null || echo "???")
+        desc=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['description'][:40])" "$case_json" 2>/dev/null || echo "???")
 
         [[ "$cn" == "$current_case" ]] && marker=" *"
 
@@ -273,7 +283,7 @@ cmd_close() {
     fi
 
     local status
-    status=$(python3 -c "import json; print(json.load(open('${case_json}'))['status'])" 2>/dev/null)
+    status=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['status'])" "$case_json" 2>/dev/null)
     if [[ "$status" == "closed" ]]; then
         log_warn "Case ${case_number} is already closed."
         exit 0
@@ -290,31 +300,45 @@ cmd_close() {
     echo "" >> "$integrity_log"
 
     local evidence_ok=true
+    local evidence_count=0
     if [[ -d "${case_dir}/evidence" ]]; then
         while IFS= read -r -d '' efile; do
             local hash
-            hash=$(sha256sum "$efile" | awk '{print $1}')
-            echo "SHA256: ${hash}  ${efile}" >> "$integrity_log"
-            log_info "  Verified: $(basename "$efile") -> ${hash:0:16}..."
+            if hash=$(sha256sum "$efile" 2>/dev/null | awk '{print $1}'); then
+                echo "SHA256: ${hash}  ${efile}" >> "$integrity_log"
+                log_info "  Verified: $(basename "$efile") -> ${hash:0:16}..."
+                evidence_count=$((evidence_count + 1))
+            else
+                echo "FAILED: Could not hash ${efile}" >> "$integrity_log"
+                log_error "  FAILED to hash: $(basename "$efile")"
+                evidence_ok=false
+            fi
         done < <(find "${case_dir}/evidence" -type f -print0 2>/dev/null)
     fi
 
     echo "" >> "$integrity_log"
-    echo "Verification complete." >> "$integrity_log"
+    echo "Files verified: ${evidence_count}" >> "$integrity_log"
+    if [[ "$evidence_ok" == "true" ]]; then
+        echo "Verification complete. All files OK." >> "$integrity_log"
+    else
+        echo "WARNING: Some files failed integrity verification!" >> "$integrity_log"
+        log_warn "Some evidence files failed integrity verification."
+    fi
 
     # Update case.json status
     local closed_date
     closed_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     python3 -c "
-import json
-with open('${case_json}', 'r') as f:
+import json, sys
+fpath, closed = sys.argv[1], sys.argv[2]
+with open(fpath, 'r') as f:
     data = json.load(f)
 data['status'] = 'closed'
-data['modified'] = '${closed_date}'
-data['closed'] = '${closed_date}'
-with open('${case_json}', 'w') as f:
+data['modified'] = closed
+data['closed'] = closed
+with open(fpath, 'w') as f:
     json.dump(data, f, indent=4)
-" 2>/dev/null
+" "$case_json" "$closed_date" 2>/dev/null
 
     # Chain of custody log entry
     coc_log "$case_dir" "CASE_CLOSED" "Case ${case_number}" "$(whoami)" "Case finalized with integrity verification"

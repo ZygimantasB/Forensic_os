@@ -193,7 +193,6 @@ action_hash_verify() {
     filepath=$(file_chooser "Select File to Hash") || return
     [[ -z "$filepath" ]] && return
 
-    local hash_result
     (
         echo "20"; echo "# Computing MD5..."
         echo "50"; echo "# Computing SHA-256..."
@@ -368,18 +367,31 @@ main_window() {
                 2>/dev/null) || break
 
             # YAD FBTN fields return the button number that was clicked
-            case "$choice" in
-                *1*) action_new_case ;;
-                *2*) action_acquire_image ;;
-                *3*) action_mount_evidence ;;
-                *4*) action_hash_verify ;;
-                *5*) action_file_carving ;;
-                *6*) action_timeline ;;
-                *7*) action_memory_forensics ;;
-                *8*) action_network_forensics ;;
-                *9*) action_log_analysis ;;
-                *10*) action_generate_report ;;
-                *11*) action_case_status ;;
+            # Count which button was pressed by counting the separator-delimited fields
+            # YAD FBTN returns empty fields separated by | - the pressed button's field has content
+            local btn_num=0
+            local field_idx=0
+            IFS='|' read -ra fields <<< "$choice"
+            for f in "${fields[@]}"; do
+                field_idx=$((field_idx + 1))
+                if [[ -n "$f" ]]; then
+                    btn_num=$field_idx
+                    break
+                fi
+            done
+
+            case "$btn_num" in
+                1)  action_new_case ;;
+                2)  action_acquire_image ;;
+                3)  action_mount_evidence ;;
+                4)  action_hash_verify ;;
+                5)  action_file_carving ;;
+                6)  action_timeline ;;
+                7)  action_memory_forensics ;;
+                8)  action_network_forensics ;;
+                9)  action_log_analysis ;;
+                10) action_generate_report ;;
+                11) action_case_status ;;
             esac
         done
     else

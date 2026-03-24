@@ -145,7 +145,7 @@ if [[ "$SUBCOMMAND" == "acquire" ]]; then
 
         lime)
             # LiME is a kernel module
-            LIME_MOD="$(find /lib/modules/$(uname -r) -name 'lime.ko*' 2>/dev/null | head -1)"
+            LIME_MOD="$(find "/lib/modules/$(uname -r)" -name 'lime.ko*' 2>/dev/null | head -1)"
             if [[ -z "$LIME_MOD" ]]; then
                 log_error "LiME kernel module not found for kernel $(uname -r)."
                 log_error "Build it: cd LiME/src && make"
@@ -281,7 +281,7 @@ if [[ "$SUBCOMMAND" == "analyze" ]]; then
         log_info "Running all common plugins..."
 
         # Try Windows plugins first, then Linux
-        ALL_PLUGINS=("${WINDOWS_PLUGINS[@]}" "${LINUX_PLUGINS[@]:-}")
+        ALL_PLUGINS=("${WINDOWS_PLUGINS[@]}" "${COMMON_PLUGINS[@]}")
 
         for p in "${WINDOWS_PLUGINS[@]}"; do
             run_plugin "$p" "$OUTPUT" || log_warn "Plugin ${p} failed (may not apply to this image)."

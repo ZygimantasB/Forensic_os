@@ -147,7 +147,7 @@ if [[ "$SUBCOMMAND" == "capture" ]]; then
     )
 
     if [[ -n "$BPF_FILTER" ]]; then
-        TCPDUMP_CMD+=($BPF_FILTER)
+        TCPDUMP_CMD+=("$BPF_FILTER")
     fi
 
     log_info "Executing: ${TCPDUMP_CMD[*]}"
