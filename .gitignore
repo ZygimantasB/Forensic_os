@@ -12,6 +12,8 @@ config/live-build/local/
 config/live-build/source/
 config/live-build/binary.contents
 config/live-build/build.log
+chroot/
+.build/
 
 # Case data (never commit evidence)
 cases/
