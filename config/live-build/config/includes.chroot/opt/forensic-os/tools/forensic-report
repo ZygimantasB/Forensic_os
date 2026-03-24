@@ -22,6 +22,16 @@ log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
+# HTML-encode special characters to prevent XSS
+html_escape() {
+    local s="$1"
+    s="${s//&/&amp;}"
+    s="${s//</&lt;}"
+    s="${s//>/&gt;}"
+    s="${s//\"/&quot;}"
+    echo "$s"
+}
+
 usage() {
     cat <<'EOF'
 Usage: forensic-report <command> [options]
@@ -67,7 +77,7 @@ resolve_case_dir() {
 read_case_field() {
     local case_json="$1"
     local field="$2"
-    python3 -c "import json; print(json.load(open('${case_json}')).get('${field}', 'N/A'))" 2>/dev/null || echo "N/A"
+    python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], 'N/A'))" "$case_json" "$field" 2>/dev/null || echo "N/A"
 }
 
 # Build evidence table HTML rows
@@ -91,15 +101,16 @@ build_evidence_table() {
         # Human-readable size
         local hr_size
         if [[ $fsize -ge 1073741824 ]]; then
-            hr_size="$(awk "BEGIN {printf \"%.2f GB\", ${fsize}/1073741824}")"
+            hr_size="$(awk -v s="$fsize" 'BEGIN {printf "%.2f GB", s/1073741824}')"
         elif [[ $fsize -ge 1048576 ]]; then
-            hr_size="$(awk "BEGIN {printf \"%.2f MB\", ${fsize}/1048576}")"
+            hr_size="$(awk -v s="$fsize" 'BEGIN {printf "%.2f MB", s/1048576}')"
         elif [[ $fsize -ge 1024 ]]; then
-            hr_size="$(awk "BEGIN {printf \"%.2f KB\", ${fsize}/1024}")"
+            hr_size="$(awk -v s="$fsize" 'BEGIN {printf "%.2f KB", s/1024}')"
         else
             hr_size="${fsize} B"
         fi
 
+        fname="$(html_escape "$fname")"
         rows+="<tr><td>${count}</td><td>${fname}</td><td>${hr_size}</td><td><code>${fhash}</code></td></tr>"
     done < <(find "$evidence_dir" -maxdepth 1 -type f -print0 2>/dev/null)
 
@@ -129,6 +140,9 @@ build_timeline_html() {
         handler=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['handler'])" 2>/dev/null || echo "")
         notes=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['notes'])" 2>/dev/null || echo "")
 
+        item="$(html_escape "$item")"
+        handler="$(html_escape "$handler")"
+        notes="$(html_escape "$notes")"
         rows+="<tr><td>${ts}</td><td>${action}</td><td>${item}</td><td>${handler}</td><td>${notes}</td></tr>"
     done < "$coc_file"
 
@@ -159,6 +173,9 @@ build_coc_html() {
         to_f=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('to',''))" 2>/dev/null || echo "")
         notes=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('notes',''))" 2>/dev/null || echo "")
 
+        item="$(html_escape "$item")"
+        handler="$(html_escape "$handler")"
+        notes="$(html_escape "$notes")"
         rows+="<tr><td>${ts}</td><td>${action}</td><td>${item}</td><td>${handler}</td><td>${from_f}</td><td>${to_f}</td><td>${notes}</td></tr>"
     done < "$coc_file"
 
@@ -223,7 +240,7 @@ cmd_generate() {
         if [[ -n "$note_files" ]]; then
             notes_content=""
             while IFS= read -r nf; do
-                notes_content+="<h4>$(basename "$nf")</h4><pre>$(cat "$nf")</pre>"
+                notes_content+="<h4>$(html_escape "$(basename "$nf")")</h4><pre>$(html_escape "$(cat "$nf")")</pre>"
             done <<< "$note_files"
         fi
     fi
@@ -238,12 +255,12 @@ cmd_generate() {
     # Generate HTML by substituting template placeholders
     local html_content
     html_content=$(cat "$template")
-    html_content="${html_content//\{\{CASE_NUMBER\}\}/$case_number}"
-    html_content="${html_content//\{\{EXAMINER\}\}/$examiner}"
+    html_content="${html_content//\{\{CASE_NUMBER\}\}/$(html_escape "$case_number")}"
+    html_content="${html_content//\{\{EXAMINER\}\}/$(html_escape "$examiner")}"
     html_content="${html_content//\{\{DATE\}\}/$report_date}"
     html_content="${html_content//\{\{CREATED_DATE\}\}/$created}"
-    html_content="${html_content//\{\{DESCRIPTION\}\}/$description}"
-    html_content="${html_content//\{\{STATUS\}\}/$status}"
+    html_content="${html_content//\{\{DESCRIPTION\}\}/$(html_escape "$description")}"
+    html_content="${html_content//\{\{STATUS\}\}/$(html_escape "$status")}"
     html_content="${html_content//\{\{EVIDENCE_ROWS\}\}/$evidence_rows}"
     html_content="${html_content//\{\{TIMELINE_ROWS\}\}/$timeline_rows}"
     html_content="${html_content//\{\{COC_ROWS\}\}/$coc_rows}"

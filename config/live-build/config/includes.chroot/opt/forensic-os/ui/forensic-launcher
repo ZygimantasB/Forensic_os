@@ -61,7 +61,7 @@ prompt_input() {
     [[ -n "$default" ]] && display_prompt="${prompt} [${default}]"
     read -rp "  ${display_prompt}: " value
     [[ -z "$value" ]] && value="$default"
-    eval "$var_name=\"$value\""
+    printf -v "$var_name" '%s' "$value"
 }
 
 pause() {

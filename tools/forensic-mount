@@ -79,9 +79,9 @@ if [[ "$LIST_MODE" -eq 1 ]]; then
     # Show all ro mounts, filtering to likely evidence paths
     while IFS= read -r line; do
         dev="$(echo "$line" | awk '{print $1}')"
-        mnt="$(echo "$line" | awk '{print $3}')"
-        fst="$(echo "$line" | awk '{print $5}')"
-        opts="$(echo "$line" | awk -F'[()]' '{print $2}')"
+        mnt="$(echo "$line" | awk '{print $2}')"
+        fst="$(echo "$line" | awk '{print $3}')"
+        opts="$(echo "$line" | awk '{print $4}')"
         if [[ "$opts" == *"ro"* ]]; then
             printf "%-40s %-30s %-10s %s\n" "$dev" "$mnt" "$fst" "$opts"
         fi
@@ -185,7 +185,7 @@ if "${MOUNT_CMD[@]}"; then
     log_success "  ${SOURCE} -> ${MOUNTPOINT}"
 
     # Display mount verification
-    ACTUAL_OPTS="$(grep " ${MOUNTPOINT} " /proc/mounts 2>/dev/null | awk -F'[()]' '{print $2}' || echo "unknown")"
+    ACTUAL_OPTS="$(awk -v mp="$MOUNTPOINT" '$2 == mp {print $4}' /proc/mounts 2>/dev/null || echo "unknown")"
     log_info "  Verified mount options: ${ACTUAL_OPTS}"
 
     # Verify read-only

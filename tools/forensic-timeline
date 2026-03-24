@@ -102,6 +102,7 @@ START_TIME="$(date +%s)"
 run_plaso() {
     local plaso_storage
     plaso_storage="$(mktemp -u).plaso"
+    trap 'rm -f "$plaso_storage"' EXIT
 
     log_info "Using log2timeline (Plaso) for timeline generation..."
 
@@ -189,8 +190,11 @@ run_fls() {
                 while IFS=',' read -r date size macb perms uid gid inode name; do
                     [[ "$date" == "Date"* ]] && continue  # skip header
                     if [[ "$first" -eq 1 ]]; then first=0; else echo ","; fi
+                    # Escape backslashes and quotes for valid JSON
+                    local esc_name="${name//\\/\\\\}"
+                    esc_name="${esc_name//\"/\\\"}"
                     printf '  {"date":"%s","size":"%s","macb":"%s","perms":"%s","uid":"%s","gid":"%s","inode":"%s","name":"%s"}' \
-                        "$date" "$size" "$macb" "$perms" "$uid" "$gid" "$inode" "$name"
+                        "$date" "$size" "$macb" "$perms" "$uid" "$gid" "$inode" "$esc_name"
                 done < <("${mactime_cmd[@]}" 2>/dev/null)
                 echo ""
                 echo "]"
@@ -218,8 +222,13 @@ run_fls() {
 HTMLHEAD
                 while IFS=',' read -r date size macb perms uid gid inode name; do
                     [[ "$date" == "Date"* ]] && continue
+                    # HTML-escape the name field to prevent XSS from crafted filenames
+                    local esc_name="${name//&/&amp;}"
+                    esc_name="${esc_name//</&lt;}"
+                    esc_name="${esc_name//>/&gt;}"
+                    esc_name="${esc_name//\"/&quot;}"
                     printf '<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n' \
-                        "$date" "$size" "$macb" "$perms" "$uid" "$gid" "$inode" "$name"
+                        "$date" "$size" "$macb" "$perms" "$uid" "$gid" "$inode" "$esc_name"
                 done < <("${mactime_cmd[@]}" 2>/dev/null)
                 echo "</tbody></table></body></html>"
             } > "$OUTPUT"

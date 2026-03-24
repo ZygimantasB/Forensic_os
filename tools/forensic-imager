@@ -97,6 +97,7 @@ log_info "  Format : ${FORMAT}"
 log_info "  Block  : ${BLOCKSIZE}"
 
 START_TIME="$(date +%s)"
+VERIFY_HASH=""
 
 case "$FORMAT" in
     raw)
@@ -108,7 +109,8 @@ case "$FORMAT" in
                 statusinterval=256 \
                 conv=noerror,sync
             HASH_FILE="${OUTPUT}.sha256"
-            IMAGE_HASH="$(awk '/Total/{print $NF}' "$HASH_FILE" 2>/dev/null || tail -1 "$HASH_FILE" | awk '{print $1}')"
+            IMAGE_HASH="$(awk '/Total/{print $NF}' "$HASH_FILE" 2>/dev/null)"
+            [[ -z "$IMAGE_HASH" ]] && IMAGE_HASH="$(tail -1 "$HASH_FILE" | awk '{print $1}')"
         elif check_tool dc3dd dc3dd 2>/dev/null; then
             log_info "Using dc3dd for imaging."
             dc3dd if="$SOURCE" of="$OUTPUT" bs="$BLOCKSIZE" \

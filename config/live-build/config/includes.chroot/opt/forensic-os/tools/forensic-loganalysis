@@ -167,10 +167,10 @@ read_log() {
             python3 -c "
 import Evtx.Evtx as evtx
 import sys
-with evtx.Evtx('$file') as log:
+with evtx.Evtx(sys.argv[1]) as log:
     for record in log.records():
         print(record.xml())
-" 2>/dev/null
+" "$file" 2>/dev/null
         else
             log_warn "Cannot parse EVTX: ${file} (install evtx_dump or python-evtx)"
             return 1
@@ -201,7 +201,9 @@ detect_type() {
 
 # ---- Output setup ------------------------------------------------------------
 TMPOUT="$(mktemp)"
-trap 'rm -f "$TMPOUT"' EXIT
+TIMELINE_TMP=""
+SORTED_TMP=""
+trap 'rm -f "$TMPOUT" "$TIMELINE_TMP" "$SORTED_TMP"' EXIT
 
 # =============================================================================
 # Keyword search mode
