@@ -9,184 +9,116 @@ echo "[HOOK] Starting forensic environment setup..."
 # 1. Disable swap to prevent evidence contamination
 # =============================================================================
 echo "[HOOK] Disabling swap..."
-swapoff -a 2>/dev/null || true
-# Remove swap entries from fstab
-sed -i '/\sswap\s/d' /etc/fstab 2>/dev/null || true
-# Prevent swap from being enabled at boot
-cat > /etc/sysctl.d/99-forensic-noswap.conf << 'EOF'
-vm.swappiness=0
-EOF
+echo "vm.swappiness=0" >> /etc/sysctl.d/99-forensic.conf
 
-# Create systemd override to disable zram/swap services
-mkdir -p /etc/systemd/system
-for svc in swap.target zram-setup@.service; do
-    ln -sf /dev/null "/etc/systemd/system/${svc}" 2>/dev/null || true
-done
+# Remove any swap entries from fstab
+sed -i '/swap/d' /etc/fstab 2>/dev/null || true
 
 # =============================================================================
-# 2. Create forensic user
+# 2. Disable automount to prevent evidence modification
 # =============================================================================
-echo "[HOOK] Setting up forensic user..."
-if ! id -u forensic &>/dev/null; then
+echo "[HOOK] Disabling automount..."
+mkdir -p /etc/udisks2
+cat > /etc/udisks2/udisks2.conf << 'UDISKS'
+[udisks2]
+modules=*
+modules_load_preference=ondemand
+
+[defaults]
+encryption=luks1
+
+[ATA]
+# Disable automount
+automount=false
+UDISKS
+
+# =============================================================================
+# 3. Create forensic user
+# =============================================================================
+echo "[HOOK] Creating forensic user..."
+if ! id forensic &>/dev/null; then
     useradd -m -s /bin/bash -G sudo,disk,cdrom,plugdev forensic
     echo "forensic:forensic" | chpasswd
 fi
 
-# Allow forensic user to sudo without password (live environment)
-echo "forensic ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/forensic
-chmod 0440 /etc/sudoers.d/forensic
+# =============================================================================
+# 4. Create symlinks for forensic tools
+# =============================================================================
+echo "[HOOK] Creating symlinks for forensic tools..."
+TOOLS_DIR="/opt/forensic-os/tools"
+if [ -d "$TOOLS_DIR" ]; then
+    for tool in "$TOOLS_DIR"/forensic-*; do
+        [ -f "$tool" ] || continue
+        toolname=$(basename "$tool")
+        ln -sf "$tool" "/usr/local/bin/$toolname"
+        chmod +x "$tool"
+    done
+fi
+
+# Symlink the launchers
+[ -f /opt/forensic-os/ui/forensic-launcher ] && \
+    ln -sf /opt/forensic-os/ui/forensic-launcher /usr/local/bin/forensic-launcher
+[ -f /opt/forensic-os/ui/forensic-gui ] && \
+    ln -sf /opt/forensic-os/ui/forensic-gui /usr/local/bin/forensic-gui
 
 # =============================================================================
-# 3. Configure LightDM for auto-login
+# 5. Install the udev write-blocking rules
 # =============================================================================
-echo "[HOOK] Configuring display manager..."
+echo "[HOOK] Installing udev write-blocking rules..."
+if [ -f /opt/forensic-os/config/99-forensic-writeblock.rules ]; then
+    cp /opt/forensic-os/config/99-forensic-writeblock.rules /etc/udev/rules.d/
+fi
+
+# =============================================================================
+# 6. Configure LightDM autologin
+# =============================================================================
+echo "[HOOK] Configuring autologin..."
 mkdir -p /etc/lightdm/lightdm.conf.d
-cat > /etc/lightdm/lightdm.conf.d/50-forensic-autologin.conf << 'EOF'
+cat > /etc/lightdm/lightdm.conf.d/50-forensic-autologin.conf << 'LIGHTDM'
 [Seat:*]
 autologin-user=forensic
 autologin-user-timeout=0
-user-session=xfce
-EOF
+LIGHTDM
 
 # =============================================================================
-# 4. Configure XFCE desktop for forensic use
-# =============================================================================
-echo "[HOOK] Configuring XFCE desktop..."
-FORENSIC_HOME="/home/forensic"
-XFCE_CONFIG="${FORENSIC_HOME}/.config/xfce4"
-mkdir -p "${XFCE_CONFIG}/terminal" "${XFCE_CONFIG}/panel" "${XFCE_CONFIG}/xfconf/xfce-perchannel-xml"
-
-# Dark theme and panel config
-cat > "${XFCE_CONFIG}/xfconf/xfce-perchannel-xml/xsettings.xml" << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<channel name="xsettings" version="1.0">
-  <property name="Net" type="empty">
-    <property name="ThemeName" type="string" value="Adwaita-dark"/>
-    <property name="IconThemeName" type="string" value="Adwaita"/>
-  </property>
-</channel>
-EOF
-
-# Desktop wallpaper message
-cat > "${XFCE_CONFIG}/xfconf/xfce-perchannel-xml/xfce4-desktop.xml" << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<channel name="xfce4-desktop" version="1.0">
-  <property name="backdrop" type="empty">
-    <property name="screen0" type="empty">
-      <property name="monitorVirtual1" type="empty">
-        <property name="workspace0" type="empty">
-          <property name="color-style" type="int" value="0"/>
-          <property name="rgba1" type="array">
-            <value type="double" value="0.1"/>
-            <value type="double" value="0.1"/>
-            <value type="double" value="0.15"/>
-            <value type="double" value="1"/>
-          </property>
-        </property>
-      </property>
-    </property>
-  </property>
-</channel>
-EOF
-
-# =============================================================================
-# 5. Create forensic desktop launchers
-# =============================================================================
-echo "[HOOK] Creating desktop launchers..."
-DESKTOP_DIR="${FORENSIC_HOME}/Desktop"
-mkdir -p "${DESKTOP_DIR}"
-
-cat > "${DESKTOP_DIR}/autopsy.desktop" << 'EOF'
-[Desktop Entry]
-Type=Application
-Name=Autopsy
-Comment=Digital Forensics Platform
-Exec=autopsy
-Icon=autopsy
-Terminal=false
-Categories=System;Security;
-EOF
-
-cat > "${DESKTOP_DIR}/wireshark.desktop" << 'EOF'
-[Desktop Entry]
-Type=Application
-Name=Wireshark
-Comment=Network Protocol Analyzer
-Exec=wireshark
-Icon=wireshark
-Terminal=false
-Categories=Network;Security;
-EOF
-
-cat > "${DESKTOP_DIR}/guymager.desktop" << 'EOF'
-[Desktop Entry]
-Type=Application
-Name=Guymager
-Comment=Forensic Disk Imager
-Exec=sudo guymager
-Icon=guymager
-Terminal=false
-Categories=System;Security;
-EOF
-
-chmod +x "${DESKTOP_DIR}"/*.desktop
-
-# =============================================================================
-# 6. Install Python forensic packages via pip
-# =============================================================================
-echo "[HOOK] Installing Python forensic packages..."
-pip3 install --break-system-packages --no-cache-dir \
-    volatility3 \
-    yara-python \
-    dfvfs \
-    plaso \
-    artifacts \
-    dtfabric \
-    pycryptodome \
-    python-registry \
-    iocextract \
-    oletools \
-    peepdf \
-    pdf-parser \
-    2>/dev/null || echo "[HOOK] WARNING: Some pip packages failed to install (non-fatal)"
-
-# =============================================================================
-# 7. Forensic-safe mount defaults
-# =============================================================================
-echo "[HOOK] Configuring forensic-safe mount defaults..."
-cat > /etc/udev/rules.d/99-forensic-readonly.rules << 'EOF'
-# Default block devices to read-only to prevent evidence tampering
-# The user must explicitly remount read-write if needed
-SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", ATTR{ro}="1"
-EOF
-
-# udisks2 policy: mount as read-only by default
-mkdir -p /etc/udisks2
-cat > /etc/udisks2/mount_options.conf << 'EOF'
-[defaults]
-defaults=ro,noatime,noexec,nosuid,nodev
-EOF
-
-# =============================================================================
-# 8. Set forensic MOTD
+# 7. Set MOTD banner
 # =============================================================================
 echo "[HOOK] Setting MOTD..."
-cat > /etc/motd << 'EOF'
+cat > /etc/motd << 'MOTD'
 
-  _____ ___  ____  _____ _   _ ____ ___ ____    ___  ____
- |  ___/ _ \|  _ \| ____| \ | / ___|_ _/ ___|  / _ \/ ___|
- | |_ | | | | |_) |  _| |  \| \___ \| | |     | | | \___ \
- |  _|| |_| |  _ <| |___| |\  |___) | | |___  | |_| |___) |
- |_|   \___/|_| \_\_____|_| \_|____/___\____|  \___/|____/
+  ╔══════════════════════════════════════════════════╗
+  ║            ForensicOS - Digital Forensics        ║
+  ║                                                  ║
+  ║  WARNING: All drives are WRITE-BLOCKED by       ║
+  ║  default. Use forensic-mount to safely mount     ║
+  ║  evidence drives.                                ║
+  ║                                                  ║
+  ║  Type 'forensic-launcher' to start the           ║
+  ║  investigation toolkit.                          ║
+  ╚══════════════════════════════════════════════════╝
 
- Forensic Workstation - All drives mounted READ-ONLY by default.
- Use 'sudo mount -o remount,rw /dev/sdX /mnt' to enable write access.
-
-EOF
+MOTD
 
 # =============================================================================
-# 9. Fix ownership
+# 8. Desktop autostart for forensic launcher
 # =============================================================================
-chown -R forensic:forensic "${FORENSIC_HOME}"
+echo "[HOOK] Setting up desktop autostart..."
+mkdir -p /etc/xdg/autostart
+cat > /etc/xdg/autostart/forensic-welcome.desktop << 'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=ForensicOS Welcome
+Exec=/bin/bash -c 'sleep 2 && zenity --info --title="ForensicOS" --text="Welcome to ForensicOS\n\nAll drives are WRITE-BLOCKED.\nUse forensic-launcher or forensic-gui to begin.\n\nType forensic-launcher in terminal for CLI mode." --width=400 2>/dev/null || true'
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+DESKTOP
+
+# =============================================================================
+# 9. Install pip packages (volatility3)
+# =============================================================================
+echo "[HOOK] Installing pip forensic tools..."
+pip3 install --break-system-packages volatility3 2>/dev/null || \
+    echo "[HOOK] WARN: volatility3 pip install failed (non-critical)"
 
 echo "[HOOK] Forensic environment setup complete."

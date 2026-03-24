@@ -103,6 +103,10 @@ main() {
     echo ""
 
     preflight
+
+    log_step "Preparing chroot overlay with forensic tools..."
+    bash "${SCRIPT_DIR}/prepare-chroot.sh"
+
     do_build
 }
 

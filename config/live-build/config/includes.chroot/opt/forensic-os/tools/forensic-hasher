@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# =============================================================================
+# forensic-hasher - Cryptographic hash computation and verification
+# =============================================================================
+# Computes and verifies hashes for files and directories in hashdeep-compatible
+# format. Supports MD5, SHA1, SHA256, SHA512, and all combined.
+# =============================================================================
+set -euo pipefail
+
+FORENSIC_TOOL_NAME="forensic-hasher"
+
+# ---- Source common library ---------------------------------------------------
+if [[ -f /opt/forensic-os/lib/forensic-common.sh ]]; then
+    source /opt/forensic-os/lib/forensic-common.sh
+elif [[ -f "$(dirname "$0")/../lib/forensic-common.sh" ]]; then
+    source "$(dirname "$0")/../lib/forensic-common.sh"
+else
+    echo "FATAL: forensic-common.sh not found." >&2
+    exit 1
+fi
+
+# ---- Usage -------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${BOLD}Usage:${NC} forensic-hasher [OPTIONS]
+
+${BOLD}Options:${NC}
+  -f FILE        Hash a single file
+  -d DIRECTORY   Hash all files in a directory
+  -a ALGORITHM   Algorithm: md5, sha1, sha256 (default), sha512, all
+  -v HASH        Verify file (-f) against this known hash value
+  -r             Recurse into subdirectories (with -d)
+  -o OUTPUT      Write results to output file
+  -h             Show this help
+
+${BOLD}Examples:${NC}
+  forensic-hasher -f evidence.img -a sha256
+  forensic-hasher -d /mnt/evidence -a all -r -o hashes.txt
+  forensic-hasher -f evidence.img -a sha256 -v abc123...
+EOF
+    exit "${1:-0}"
+}
+
+# ---- Argument Parsing --------------------------------------------------------
+TARGET_FILE=""
+TARGET_DIR=""
+ALGORITHM="sha256"
+VERIFY_HASH=""
+RECURSIVE=0
+OUTPUT_FILE=""
+
+while getopts ":f:d:a:v:ro:h" opt; do
+    case "$opt" in
+        f) TARGET_FILE="$OPTARG" ;;
+        d) TARGET_DIR="$OPTARG" ;;
+        a) ALGORITHM="$OPTARG" ;;
+        v) VERIFY_HASH="$OPTARG" ;;
+        r) RECURSIVE=1 ;;
+        o) OUTPUT_FILE="$OPTARG" ;;
+        h) usage 0 ;;
+        :) log_error "Option -${OPTARG} requires an argument."; usage 1 ;;
+        *) log_error "Unknown option: -${OPTARG}"; usage 1 ;;
+    esac
+done
+
+# ---- Validation --------------------------------------------------------------
+if [[ -z "$TARGET_FILE" && -z "$TARGET_DIR" ]]; then
+    log_error "Specify -f (file) or -d (directory)."
+    usage 1
+fi
+
+VALID_ALGOS=("md5" "sha1" "sha256" "sha512" "all")
+valid=0
+for a in "${VALID_ALGOS[@]}"; do [[ "$ALGORITHM" == "$a" ]] && valid=1; done
+if [[ "$valid" -eq 0 ]]; then
+    log_error "Unsupported algorithm: ${ALGORITHM}. Use: md5, sha1, sha256, sha512, all."
+    exit 1
+fi
+
+# ---- Helper: get the hash command for an algorithm ---------------------------
+hash_cmd() {
+    case "$1" in
+        md5)    echo "md5sum" ;;
+        sha1)   echo "sha1sum" ;;
+        sha256) echo "sha256sum" ;;
+        sha512) echo "sha512sum" ;;
+    esac
+}
+
+# ---- Helper: compute hash(es) for one file ----------------------------------
+# Outputs hashdeep-compatible lines: size,hash[,hash...],filename
+compute_hashes() {
+    local file="$1"
+    local size
+    size="$(stat -c%s "$file" 2>/dev/null || echo 0)"
+
+    if [[ "$ALGORITHM" == "all" ]]; then
+        local h_md5 h_sha1 h_sha256 h_sha512
+        h_md5="$(md5sum "$file" | awk '{print $1}')"
+        h_sha1="$(sha1sum "$file" | awk '{print $1}')"
+        h_sha256="$(sha256sum "$file" | awk '{print $1}')"
+        h_sha512="$(sha512sum "$file" | awk '{print $1}')"
+        printf '%s,%s,%s,%s,%s,%s\n' "$size" "$h_md5" "$h_sha1" "$h_sha256" "$h_sha512" "$file"
+    else
+        local cmd
+        cmd="$(hash_cmd "$ALGORITHM")"
+        local h
+        h="$($cmd "$file" | awk '{print $1}')"
+        printf '%s,%s,%s\n' "$size" "$h" "$file"
+    fi
+}
+
+# ---- Output setup ------------------------------------------------------------
+# We collect output in a temp file, then optionally write to OUTPUT_FILE.
+TMPOUT="$(mktemp)"
+trap 'rm -f "$TMPOUT"' EXIT
+
+# Print hashdeep-style header
+{
+    echo "%%%% HASHDEEP-1.0"
+    echo "%%%% size,$(if [[ "$ALGORITHM" == "all" ]]; then echo "md5,sha1,sha256,sha512"; else echo "$ALGORITHM"; fi),filename"
+    echo "## Invoked from: $(pwd)"
+    echo "## Timestamp: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "##"
+} > "$TMPOUT"
+
+# ---- Verification mode (single file) ----------------------------------------
+if [[ -n "$VERIFY_HASH" ]]; then
+    if [[ -z "$TARGET_FILE" ]]; then
+        log_error "Verification mode requires -f (file)."
+        exit 1
+    fi
+    if [[ ! -f "$TARGET_FILE" ]]; then
+        log_error "File not found: ${TARGET_FILE}"
+        exit 1
+    fi
+    audit_log "Verifying hash: file=${TARGET_FILE} algo=${ALGORITHM}"
+    verify_hash "$TARGET_FILE" "$VERIFY_HASH" "$ALGORITHM"
+    exit $?
+fi
+
+# ---- Single file mode -------------------------------------------------------
+if [[ -n "$TARGET_FILE" ]]; then
+    if [[ ! -f "$TARGET_FILE" ]]; then
+        log_error "File not found: ${TARGET_FILE}"
+        exit 1
+    fi
+    log_info "Hashing file: ${TARGET_FILE} (${ALGORITHM})"
+    audit_log "Hashing file: ${TARGET_FILE} algo=${ALGORITHM}"
+    compute_hashes "$TARGET_FILE" >> "$TMPOUT"
+fi
+
+# ---- Directory mode ----------------------------------------------------------
+if [[ -n "$TARGET_DIR" ]]; then
+    if [[ ! -d "$TARGET_DIR" ]]; then
+        log_error "Directory not found: ${TARGET_DIR}"
+        exit 1
+    fi
+
+    log_info "Hashing directory: ${TARGET_DIR} (${ALGORITHM}, recursive=${RECURSIVE})"
+    audit_log "Hashing directory: ${TARGET_DIR} algo=${ALGORITHM} recursive=${RECURSIVE}"
+
+    file_count=0
+    if [[ "$RECURSIVE" -eq 1 ]]; then
+        while IFS= read -r -d '' file; do
+            compute_hashes "$file" >> "$TMPOUT"
+            file_count=$((file_count + 1))
+            if (( file_count % 100 == 0 )); then
+                log_info "  Processed ${file_count} files..."
+            fi
+        done < <(find "$TARGET_DIR" -type f -print0 2>/dev/null)
+    else
+        for file in "$TARGET_DIR"/*; do
+            [[ -f "$file" ]] || continue
+            compute_hashes "$file" >> "$TMPOUT"
+            file_count=$((file_count + 1))
+        done
+    fi
+
+    log_info "Hashed ${file_count} file(s)."
+    audit_log "Hashing complete: ${file_count} files processed."
+fi
+
+# ---- Output results ----------------------------------------------------------
+if [[ -n "$OUTPUT_FILE" ]]; then
+    cp "$TMPOUT" "$OUTPUT_FILE"
+    log_success "Results written to: ${OUTPUT_FILE}"
+else
+    cat "$TMPOUT"
+fi
+
+log_success "Hashing complete."

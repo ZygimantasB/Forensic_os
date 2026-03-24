@@ -1,41 +1,54 @@
 # Forensic OS - Base System Package List
-# Desktop environment
+# Desktop environment (lightweight XFCE)
 xfce4
+xfce4-terminal
 lightdm
+lightdm-gtk-greeter
+
+# File manager and basic desktop apps
+thunar
+mousepad
+ristretto
+file-roller
 
 # Web browser
 firefox
 
-# Terminal and editors
-xterm
-nano
-vim
-mousepad
+# System tools
+gparted
+gnome-disk-utility
+htop
+tmux
 
-# Development and scripting
-git
+# Terminal
+xterm
+bash-completion
+
+# Editors
+nano
+vim-tiny
+
+# Scripting
 python3
 python3-pip
 jq
+bc
 
 # Networking
-curl
-wget
 openssh-client
 net-tools
+curl
+wget
 
-# System utilities
-htop
-tmux
-file-roller
-gnome-disk-utility
-
-# GUI dialog tools
-yad
+# GUI dialogs for forensic scripts
 zenity
 
-# Reporting
+# PDF generation for reports
 wkhtmltopdf
 
-# Image viewer
-ristretto
+# Version control
+git
+
+# Compression
+zip
+unzip

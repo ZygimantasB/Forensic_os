@@ -1,6 +1,5 @@
 #!/bin/bash
 # Forensic OS - live-build auto/config
-# Configures the live-build environment for a forensic workstation ISO
 set -euo pipefail
 
 lb config noauto \
@@ -14,42 +13,15 @@ lb config noauto \
     --parent-mirror-bootstrap "http://archive.ubuntu.com/ubuntu" \
     --parent-mirror-chroot-security "http://security.ubuntu.com/ubuntu" \
     --binary-images iso-hybrid \
-    --memtest memtest86+ \
     --mode ubuntu \
     --system live \
-    --iso-application "Forensic OS" \
-    --iso-publisher "Forensic OS Project" \
+    --iso-application "ForensicOS" \
+    --iso-publisher "ForensicOS Project" \
     --iso-volume "ForensicOS" \
     --bootappend-live "boot=casper hostname=forensic-os username=forensic quiet splash" \
-    --debootstrap-options "--include=apt-transport-https,ca-certificates,gnupg" \
-    --apt-recommends true \
+    --apt-recommends false \
     --security true \
-    --updates true \
-    --backports true \
     --cache true \
-    --apt-indices false \
-    --firmware-binary true \
-    --firmware-chroot true \
     "${@}"
-
-# Add forensic-related repositories via chroot sources
-SOURCES_DIR="config/archives"
-mkdir -p "${SOURCES_DIR}"
-
-# GIFT PPA (plaso, log2timeline tools)
-cat > "${SOURCES_DIR}/gift-ppa.list.chroot" << 'EOF'
-deb http://ppa.launchpad.net/gift/stable/ubuntu noble main
-EOF
-
-cat > "${SOURCES_DIR}/gift-ppa.key.chroot" << 'KEYEOF'
------BEGIN PGP PUBLIC KEY BLOCK-----
-KEYEOF
-# Note: In production, replace with the actual GIFT PPA signing key.
-# Fetch with: apt-key adv --keyserver keyserver.ubuntu.com --recv-keys <KEY_ID>
-
-# REMnux PPA (malware analysis tools)
-cat > "${SOURCES_DIR}/remnux-ppa.list.chroot" << 'EOF'
-deb http://ppa.launchpad.net/remnux/stable/ubuntu noble main
-EOF
 
 echo "auto/config: Configuration complete."

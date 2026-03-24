@@ -29,3 +29,8 @@ evidence/
 /tmp/
 *.tmp
 *.bak
+config/live-build/config/binary
+config/live-build/config/bootstrap
+config/live-build/config/chroot
+config/live-build/config/common
+config/live-build/config/source

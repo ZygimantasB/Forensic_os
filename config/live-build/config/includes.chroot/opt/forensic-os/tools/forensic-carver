@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# =============================================================================
+# forensic-carver - File carving wrapper
+# =============================================================================
+# Wraps foremost, scalpel, and photorec for file carving from disk images.
+# Generates a summary of carved files with cryptographic hashes.
+# =============================================================================
+set -euo pipefail
+
+FORENSIC_TOOL_NAME="forensic-carver"
+
+# ---- Source common library ---------------------------------------------------
+if [[ -f /opt/forensic-os/lib/forensic-common.sh ]]; then
+    source /opt/forensic-os/lib/forensic-common.sh
+elif [[ -f "$(dirname "$0")/../lib/forensic-common.sh" ]]; then
+    source "$(dirname "$0")/../lib/forensic-common.sh"
+else
+    echo "FATAL: forensic-common.sh not found." >&2
+    exit 1
+fi
+
+# ---- Usage -------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${BOLD}Usage:${NC} forensic-carver -s source_image -o output_dir [OPTIONS]
+
+${BOLD}Options:${NC}
+  -s SOURCE      Source image or device to carve (required)
+  -o OUTPUT      Output directory for carved files (required)
+  -t TOOL        Carving tool: foremost (default), scalpel, photorec
+  -c CONFIG      Custom configuration file for the carving tool
+  -a ALGORITHM   Hash algorithm for summary: sha256 (default), md5, sha1
+  -v             Verbose output
+  -h             Show this help
+
+${BOLD}Examples:${NC}
+  forensic-carver -s disk.img -o carved_files/
+  forensic-carver -s disk.img -o carved_files/ -t scalpel -c scalpel.conf
+  forensic-carver -s /dev/sdb -o carved_files/ -t photorec
+EOF
+    exit "${1:-0}"
+}
+
+# ---- Argument Parsing --------------------------------------------------------
+SOURCE=""
+OUTPUT_DIR=""
+TOOL="foremost"
+CONFIG=""
+HASH_ALGO="sha256"
+
+while getopts ":s:o:t:c:a:vh" opt; do
+    case "$opt" in
+        s) SOURCE="$OPTARG" ;;
+        o) OUTPUT_DIR="$OPTARG" ;;
+        t) TOOL="$OPTARG" ;;
+        c) CONFIG="$OPTARG" ;;
+        a) HASH_ALGO="$OPTARG" ;;
+        v) FORENSIC_VERBOSE=1 ;;
+        h) usage 0 ;;
+        :) log_error "Option -${OPTARG} requires an argument."; usage 1 ;;
+        *) log_error "Unknown option: -${OPTARG}"; usage 1 ;;
+    esac
+done
+
+# ---- Validation --------------------------------------------------------------
+if [[ -z "$SOURCE" ]]; then
+    log_error "Source (-s) is required."
+    usage 1
+fi
+if [[ -z "$OUTPUT_DIR" ]]; then
+    log_error "Output directory (-o) is required."
+    usage 1
+fi
+if [[ ! -e "$SOURCE" ]]; then
+    log_error "Source does not exist: ${SOURCE}"
+    exit 1
+fi
+if [[ "$TOOL" != "foremost" && "$TOOL" != "scalpel" && "$TOOL" != "photorec" ]]; then
+    log_error "Unsupported tool: ${TOOL}. Use: foremost, scalpel, photorec."
+    exit 1
+fi
+
+if ! check_tool "$TOOL" "$TOOL"; then
+    log_error "Carving tool '${TOOL}' is not installed."
+    exit 1
+fi
+
+require_root
+
+mkdir -p "$OUTPUT_DIR" 2>/dev/null || true
+
+# ---- Carving -----------------------------------------------------------------
+audit_log "Starting file carving: source=${SOURCE} tool=${TOOL} output=${OUTPUT_DIR}"
+
+log_info "File Carving Session"
+log_info "  Source : ${SOURCE}"
+log_info "  Tool   : ${TOOL}"
+log_info "  Output : ${OUTPUT_DIR}"
+[[ -n "$CONFIG" ]] && log_info "  Config : ${CONFIG}"
+
+START_TIME="$(date +%s)"
+
+case "$TOOL" in
+    foremost)
+        CMD=(foremost -i "$SOURCE" -o "$OUTPUT_DIR")
+        if [[ -n "$CONFIG" ]]; then
+            CMD+=(-c "$CONFIG")
+        fi
+        if [[ "$FORENSIC_VERBOSE" -eq 1 ]]; then
+            CMD+=(-v)
+        fi
+        # foremost refuses to write to existing non-empty dirs
+        if [[ -d "$OUTPUT_DIR" ]] && [[ -n "$(ls -A "$OUTPUT_DIR" 2>/dev/null)" ]]; then
+            log_warn "Output directory is not empty. Foremost requires an empty or new directory."
+            OUTPUT_DIR="${OUTPUT_DIR}/foremost_$(timestamp)"
+            mkdir -p "$OUTPUT_DIR"
+            log_info "Using: ${OUTPUT_DIR}"
+            CMD=(foremost -i "$SOURCE" -o "$OUTPUT_DIR")
+            [[ -n "$CONFIG" ]] && CMD+=(-c "$CONFIG")
+            [[ "$FORENSIC_VERBOSE" -eq 1 ]] && CMD+=(-v)
+        fi
+        log_info "Executing: ${CMD[*]}"
+        "${CMD[@]}" 2>&1 | while IFS= read -r line; do
+            log_info "  [foremost] ${line}"
+        done
+        ;;
+
+    scalpel)
+        CMD=(scalpel -o "$OUTPUT_DIR" "$SOURCE")
+        if [[ -n "$CONFIG" ]]; then
+            CMD=( scalpel -c "$CONFIG" -o "$OUTPUT_DIR" "$SOURCE")
+        fi
+        log_info "Executing: ${CMD[*]}"
+        "${CMD[@]}" 2>&1 | while IFS= read -r line; do
+            log_info "  [scalpel] ${line}"
+        done
+        ;;
+
+    photorec)
+        CMD=(photorec /d "$OUTPUT_DIR" /cmd "$SOURCE" search)
+        if [[ -n "$CONFIG" ]]; then
+            log_warn "PhotoRec does not use an external config file; -c is ignored."
+        fi
+        log_info "Executing: ${CMD[*]}"
+        "${CMD[@]}" 2>&1 | while IFS= read -r line; do
+            log_info "  [photorec] ${line}"
+        done
+        ;;
+esac
+
+END_TIME="$(date +%s)"
+ELAPSED=$(( END_TIME - START_TIME ))
+
+# ---- Generate Summary --------------------------------------------------------
+log_info "Carving completed in ${ELAPSED}s. Generating summary..."
+
+SUMMARY_FILE="${OUTPUT_DIR}/carving_summary.txt"
+{
+    echo "========================================"
+    echo "  Forensic Carver - Summary Report"
+    echo "========================================"
+    echo "Source    : ${SOURCE}"
+    echo "Tool      : ${TOOL}"
+    echo "Timestamp : $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "Duration  : ${ELAPSED}s"
+    echo "Hash Algo : ${HASH_ALGO}"
+    echo ""
+    echo "Carved Files:"
+    echo "----------------------------------------"
+} > "$SUMMARY_FILE"
+
+TOTAL_FILES=0
+TOTAL_SIZE=0
+
+while IFS= read -r -d '' carved_file; do
+    TOTAL_FILES=$((TOTAL_FILES + 1))
+    fsize="$(stat -c%s "$carved_file" 2>/dev/null || echo 0)"
+    TOTAL_SIZE=$((TOTAL_SIZE + fsize))
+    fhash="$(generate_hash "$carved_file" "$HASH_ALGO" 2>/dev/null || echo "ERROR")"
+    rel_path="${carved_file#${OUTPUT_DIR}/}"
+    printf '  %s  %s  (%s)\n' "$fhash" "$rel_path" "$(format_size "$fsize")" >> "$SUMMARY_FILE"
+done < <(find "$OUTPUT_DIR" -type f ! -name "carving_summary.txt" ! -name "audit.txt" -print0 2>/dev/null)
+
+{
+    echo ""
+    echo "----------------------------------------"
+    echo "Total files carved : ${TOTAL_FILES}"
+    echo "Total size         : $(format_size "$TOTAL_SIZE")"
+    echo "========================================"
+} >> "$SUMMARY_FILE"
+
+log_info "Summary written to: ${SUMMARY_FILE}"
+log_success "Carved ${TOTAL_FILES} file(s), total $(format_size "$TOTAL_SIZE")."
+
+audit_log "Carving complete: tool=${TOOL} files=${TOTAL_FILES} size=${TOTAL_SIZE} elapsed=${ELAPSED}s"
+
+# Display summary
+cat "$SUMMARY_FILE"

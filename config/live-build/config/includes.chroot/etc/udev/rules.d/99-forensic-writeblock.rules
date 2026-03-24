@@ -1,0 +1,60 @@
+# ForensicOS - Automatic Write-Block Rules for USB and SATA Block Devices
+#
+# These rules automatically set all USB, SATA, and NVMe block devices to
+# read-only when connected, excluding the boot device. This prevents
+# accidental modification of evidence media.
+#
+# Install: sudo cp 99-forensic-writeblock.rules /etc/udev/rules.d/
+# Reload:  sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+
+# ─── Device Connection Logging ────────────────────────────────────────────────
+# Log ALL block device connections to audit log
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", \
+    RUN+="/bin/bash -c 'echo \"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) DEVICE_CONNECTED /dev/%k bus=$env{ID_BUS} vendor=$env{ID_VENDOR} model=$env{ID_MODEL} serial=$env{ID_SERIAL_SHORT}\" >> /var/log/forensic-audit.log'"
+
+# Log block device removals
+ACTION=="remove", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", \
+    RUN+="/bin/bash -c 'echo \"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) DEVICE_REMOVED /dev/%k bus=$env{ID_BUS} vendor=$env{ID_VENDOR} model=$env{ID_MODEL}\" >> /var/log/forensic-audit.log'"
+
+# ─── USB Block Devices ────────────────────────────────────────────────────────
+# Set USB storage devices to read-only on connection (skip boot device)
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", \
+    ENV{ID_BUS}=="usb", \
+    PROGRAM="/bin/bash -c 'BOOT_DEV=$(findmnt -n -o SOURCE / | sed \"s/[0-9]*$//\"); [ \"$env{DEVNAME}\" != \"$BOOT_DEV\" ] && echo 1 || echo 0'", \
+    RESULT=="1", \
+    RUN+="/sbin/blockdev --setro /dev/%k", \
+    RUN+="/usr/bin/logger -t forensic-writeblock 'WRITE-BLOCK APPLIED: /dev/%k (USB) set to read-only [%E{ID_VENDOR} %E{ID_MODEL}]'", \
+    RUN+="/bin/bash -c 'echo \"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) WRITE-BLOCK USB /dev/%k vendor=$env{ID_VENDOR} model=$env{ID_MODEL} serial=$env{ID_SERIAL_SHORT}\" >> /var/log/forensic-audit.log'"
+
+# ─── SATA/SCSI Block Devices ─────────────────────────────────────────────────
+# Set SATA/SCSI devices to read-only (excluding boot device)
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", \
+    ENV{ID_BUS}=="ata|scsi", \
+    PROGRAM="/bin/bash -c 'BOOT_DEV=$(findmnt -n -o SOURCE / | sed \"s/[0-9]*$//\"); [ \"$env{DEVNAME}\" != \"$BOOT_DEV\" ] && echo 1 || echo 0'", \
+    RESULT=="1", \
+    RUN+="/sbin/blockdev --setro /dev/%k", \
+    RUN+="/usr/bin/logger -t forensic-writeblock 'WRITE-BLOCK APPLIED: /dev/%k (SATA/SCSI) set to read-only [%E{ID_VENDOR} %E{ID_MODEL}]'", \
+    RUN+="/bin/bash -c 'echo \"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) WRITE-BLOCK SATA /dev/%k vendor=$env{ID_VENDOR} model=$env{ID_MODEL} serial=$env{ID_SERIAL_SHORT}\" >> /var/log/forensic-audit.log'"
+
+# ─── NVMe Devices ────────────────────────────────────────────────────────────
+# Set NVMe devices to read-only (excluding boot device)
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", \
+    KERNEL=="nvme*", \
+    PROGRAM="/bin/bash -c 'BOOT_DEV=$(findmnt -n -o SOURCE / | sed \"s/p[0-9]*$//\"); [ \"$env{DEVNAME}\" != \"$BOOT_DEV\" ] && echo 1 || echo 0'", \
+    RESULT=="1", \
+    RUN+="/sbin/blockdev --setro /dev/%k", \
+    RUN+="/usr/bin/logger -t forensic-writeblock 'WRITE-BLOCK APPLIED: /dev/%k (NVMe) set to read-only'", \
+    RUN+="/bin/bash -c 'echo \"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) WRITE-BLOCK NVMe /dev/%k\" >> /var/log/forensic-audit.log'"
+
+# ─── Partition Write-Block ────────────────────────────────────────────────────
+# Also set partitions to read-only on non-boot devices
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", \
+    PROGRAM="/bin/bash -c 'BOOT_DEV=$(findmnt -n -o SOURCE /); [ \"$env{DEVNAME}\" != \"$BOOT_DEV\" ] && echo 1 || echo 0'", \
+    RESULT=="1", \
+    RUN+="/sbin/blockdev --setro /dev/%k"
+
+# ─── Desktop Notification ────────────────────────────────────────────────────
+# Send desktop notification when a new block device is connected
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", \
+    RUN+="/bin/bash -c 'which notify-send >/dev/null 2>&1 && DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus notify-send -u critical -i drive-harddisk \"ForensicOS: Device Connected\" \"Device $env{DEVNAME} connected and write-blocked.\nVendor: $env{ID_VENDOR}\nModel: $env{ID_MODEL}\" 2>/dev/null || true'"

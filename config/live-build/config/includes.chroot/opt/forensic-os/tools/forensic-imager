@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# =============================================================================
+# forensic-imager - Forensic disk imaging tool
+# =============================================================================
+# Creates forensically-sound disk images in raw (dd/dcfldd) or E01/EWF format
+# with integrated hashing and verification.
+# =============================================================================
+set -euo pipefail
+
+FORENSIC_TOOL_NAME="forensic-imager"
+
+# ---- Source common library ---------------------------------------------------
+if [[ -f /opt/forensic-os/lib/forensic-common.sh ]]; then
+    # shellcheck source=/dev/null
+    source /opt/forensic-os/lib/forensic-common.sh
+elif [[ -f "$(dirname "$0")/../lib/forensic-common.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$(dirname "$0")/../lib/forensic-common.sh"
+else
+    echo "FATAL: forensic-common.sh not found." >&2
+    exit 1
+fi
+
+# ---- Usage -------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${BOLD}Usage:${NC} forensic-imager -s /dev/sdX -o output.img [OPTIONS]
+
+${BOLD}Options:${NC}
+  -s SOURCE      Source device or file to image (required)
+  -o OUTPUT      Output image path (required)
+  -f FORMAT      Image format: raw (default) or ewf
+  -c CASE_DIR    Case directory (overrides FORENSIC_CASE_DIR)
+  -b BLOCKSIZE   Block size for dd/dcfldd (default: 4096)
+  -v             Verbose output
+  -h             Show this help
+
+${BOLD}Examples:${NC}
+  forensic-imager -s /dev/sdb -o case001/disk.img
+  forensic-imager -s /dev/sdb -o case001/disk.E01 -f ewf
+  forensic-imager -s /dev/sdb -o case001/disk.img -b 65536 -v
+EOF
+    exit "${1:-0}"
+}
+
+# ---- Argument Parsing --------------------------------------------------------
+SOURCE=""
+OUTPUT=""
+FORMAT="raw"
+BLOCKSIZE="4096"
+
+while getopts ":s:o:f:c:b:vh" opt; do
+    case "$opt" in
+        s) SOURCE="$OPTARG" ;;
+        o) OUTPUT="$OPTARG" ;;
+        f) FORMAT="$OPTARG" ;;
+        c) FORENSIC_CASE_DIR="$OPTARG" ;;
+        b) BLOCKSIZE="$OPTARG" ;;
+        v) FORENSIC_VERBOSE=1 ;;
+        h) usage 0 ;;
+        :) log_error "Option -${OPTARG} requires an argument."; usage 1 ;;
+        *) log_error "Unknown option: -${OPTARG}"; usage 1 ;;
+    esac
+done
+
+# ---- Validation --------------------------------------------------------------
+if [[ -z "$SOURCE" ]]; then
+    log_error "Source (-s) is required."
+    usage 1
+fi
+if [[ -z "$OUTPUT" ]]; then
+    log_error "Output (-o) is required."
+    usage 1
+fi
+if [[ ! -e "$SOURCE" ]]; then
+    log_error "Source does not exist: ${SOURCE}"
+    exit 1
+fi
+if [[ "$FORMAT" != "raw" && "$FORMAT" != "ewf" ]]; then
+    log_error "Unsupported format: ${FORMAT}. Use 'raw' or 'ewf'."
+    exit 1
+fi
+
+require_root
+
+# Create output directory if needed
+OUTPUT_DIR="$(dirname "$OUTPUT")"
+mkdir -p "$OUTPUT_DIR" 2>/dev/null || true
+
+# ---- Imaging -----------------------------------------------------------------
+audit_log "Starting imaging: source=${SOURCE} output=${OUTPUT} format=${FORMAT}"
+
+log_info "Forensic Imaging Session"
+log_info "  Source : ${SOURCE}"
+log_info "  Output : ${OUTPUT}"
+log_info "  Format : ${FORMAT}"
+log_info "  Block  : ${BLOCKSIZE}"
+
+START_TIME="$(date +%s)"
+
+case "$FORMAT" in
+    raw)
+        # Prefer dcfldd > dc3dd > dd, use pv for progress if available
+        if check_tool dcfldd dcfldd 2>/dev/null; then
+            log_info "Using dcfldd for imaging with status output."
+            dcfldd if="$SOURCE" of="$OUTPUT" bs="$BLOCKSIZE" \
+                hash=sha256 hashlog="${OUTPUT}.sha256" \
+                statusinterval=256 \
+                conv=noerror,sync
+            HASH_FILE="${OUTPUT}.sha256"
+            IMAGE_HASH="$(awk '/Total/{print $NF}' "$HASH_FILE" 2>/dev/null || tail -1 "$HASH_FILE" | awk '{print $1}')"
+        elif check_tool dc3dd dc3dd 2>/dev/null; then
+            log_info "Using dc3dd for imaging."
+            dc3dd if="$SOURCE" of="$OUTPUT" bs="$BLOCKSIZE" \
+                hash=sha256 log="${OUTPUT}.log" \
+                conv=noerror,sync
+            IMAGE_HASH="$(generate_hash "$OUTPUT" sha256)"
+        else
+            log_info "Using dd for imaging."
+            if check_tool pv pv 2>/dev/null; then
+                SOURCE_SIZE="$(blockdev --getsize64 "$SOURCE" 2>/dev/null || stat -c%s "$SOURCE" 2>/dev/null || echo 0)"
+                dd if="$SOURCE" bs="$BLOCKSIZE" conv=noerror,sync 2>/dev/null \
+                    | pv -s "$SOURCE_SIZE" \
+                    | dd of="$OUTPUT" bs="$BLOCKSIZE" 2>/dev/null
+            else
+                dd if="$SOURCE" of="$OUTPUT" bs="$BLOCKSIZE" \
+                    conv=noerror,sync status=progress
+            fi
+            log_info "Computing SHA256 hash of image..."
+            IMAGE_HASH="$(generate_hash "$OUTPUT" sha256)"
+        fi
+        ;;
+
+    ewf)
+        if ! check_tool ewfacquire ewf-tools; then
+            log_error "ewfacquire is required for EWF/E01 format."
+            exit 1
+        fi
+        log_info "Using ewfacquire for E01 imaging."
+        ewfacquire -t "${OUTPUT%.E01}" \
+            -c best \
+            -S 0 \
+            -u \
+            "$SOURCE"
+        log_info "Computing SHA256 hash of source for verification..."
+        IMAGE_HASH="$(generate_hash "$SOURCE" sha256)"
+        ;;
+esac
+
+END_TIME="$(date +%s)"
+ELAPSED=$(( END_TIME - START_TIME ))
+
+# ---- Post-Imaging Hash Verification -----------------------------------------
+log_info "Imaging completed in ${ELAPSED}s."
+
+if [[ "$FORMAT" == "raw" ]]; then
+    log_info "Verifying image integrity..."
+    VERIFY_HASH="$(generate_hash "$OUTPUT" sha256)"
+    if [[ "${IMAGE_HASH:-}" == "$VERIFY_HASH" ]]; then
+        log_success "Image verification PASSED."
+        log_success "  SHA256: ${VERIFY_HASH}"
+    else
+        log_error "Image verification FAILED!"
+        log_error "  Original : ${IMAGE_HASH:-unknown}"
+        log_error "  Re-read  : ${VERIFY_HASH}"
+    fi
+
+    # Write hash sidecar
+    echo "${VERIFY_HASH}  $(basename "$OUTPUT")" > "${OUTPUT}.sha256.txt"
+    log_info "Hash written to ${OUTPUT}.sha256.txt"
+fi
+
+# ---- Output size info --------------------------------------------------------
+if [[ -f "$OUTPUT" ]]; then
+    IMG_SIZE="$(stat -c%s "$OUTPUT" 2>/dev/null || echo 0)"
+    log_info "Image size: $(format_size "$IMG_SIZE")"
+fi
+
+audit_log "Imaging complete: output=${OUTPUT} sha256=${VERIFY_HASH:-${IMAGE_HASH:-N/A}} elapsed=${ELAPSED}s"
+
+log_success "Forensic imaging session finished."

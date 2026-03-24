@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# =============================================================================
+# forensic-timeline - Timeline analysis tool
+# =============================================================================
+# Generates sortable timelines of filesystem activity using log2timeline/plaso
+# (preferred) or fls from The Sleuth Kit as a fallback.
+# =============================================================================
+set -euo pipefail
+
+FORENSIC_TOOL_NAME="forensic-timeline"
+
+# ---- Source common library ---------------------------------------------------
+if [[ -f /opt/forensic-os/lib/forensic-common.sh ]]; then
+    source /opt/forensic-os/lib/forensic-common.sh
+elif [[ -f "$(dirname "$0")/../lib/forensic-common.sh" ]]; then
+    source "$(dirname "$0")/../lib/forensic-common.sh"
+else
+    echo "FATAL: forensic-common.sh not found." >&2
+    exit 1
+fi
+
+# ---- Usage -------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${BOLD}Usage:${NC} forensic-timeline -s source [OPTIONS]
+
+${BOLD}Options:${NC}
+  -s SOURCE      Source image or mount point (required)
+  -o OUTPUT      Output file (default: timeline_<timestamp>.<format>)
+  -f FORMAT      Output format: csv (default), json, html
+  -t TYPE        Timeline type: filesystem (default), all
+  -S START_DATE  Filter: start date (YYYY-MM-DD)
+  -E END_DATE    Filter: end date (YYYY-MM-DD)
+  -c CASE_DIR    Case directory (overrides FORENSIC_CASE_DIR)
+  -v             Verbose output
+  -h             Show this help
+
+${BOLD}Examples:${NC}
+  forensic-timeline -s disk.img -o timeline.csv -f csv
+  forensic-timeline -s disk.img -f json -t all
+  forensic-timeline -s disk.img -S 2025-01-01 -E 2025-06-30
+EOF
+    exit "${1:-0}"
+}
+
+# ---- Argument Parsing --------------------------------------------------------
+SOURCE=""
+OUTPUT=""
+FORMAT="csv"
+TIMELINE_TYPE="filesystem"
+START_DATE=""
+END_DATE=""
+
+while getopts ":s:o:f:t:S:E:c:vh" opt; do
+    case "$opt" in
+        s) SOURCE="$OPTARG" ;;
+        o) OUTPUT="$OPTARG" ;;
+        f) FORMAT="$OPTARG" ;;
+        t) TIMELINE_TYPE="$OPTARG" ;;
+        S) START_DATE="$OPTARG" ;;
+        E) END_DATE="$OPTARG" ;;
+        c) FORENSIC_CASE_DIR="$OPTARG" ;;
+        v) FORENSIC_VERBOSE=1 ;;
+        h) usage 0 ;;
+        :) log_error "Option -${OPTARG} requires an argument."; usage 1 ;;
+        *) log_error "Unknown option: -${OPTARG}"; usage 1 ;;
+    esac
+done
+
+# ---- Validation --------------------------------------------------------------
+if [[ -z "$SOURCE" ]]; then
+    log_error "Source (-s) is required."
+    usage 1
+fi
+if [[ ! -e "$SOURCE" ]]; then
+    log_error "Source does not exist: ${SOURCE}"
+    exit 1
+fi
+if [[ "$FORMAT" != "csv" && "$FORMAT" != "json" && "$FORMAT" != "html" ]]; then
+    log_error "Unsupported format: ${FORMAT}. Use: csv, json, html."
+    exit 1
+fi
+
+# Default output file
+if [[ -z "$OUTPUT" ]]; then
+    OUTPUT="timeline_$(timestamp).${FORMAT}"
+fi
+
+audit_log "Starting timeline analysis: source=${SOURCE} format=${FORMAT} type=${TIMELINE_TYPE}"
+
+log_info "Timeline Analysis Session"
+log_info "  Source : ${SOURCE}"
+log_info "  Output : ${OUTPUT}"
+log_info "  Format : ${FORMAT}"
+log_info "  Type   : ${TIMELINE_TYPE}"
+[[ -n "$START_DATE" ]] && log_info "  Start  : ${START_DATE}"
+[[ -n "$END_DATE" ]]   && log_info "  End    : ${END_DATE}"
+
+START_TIME="$(date +%s)"
+
+# ---- Plaso / log2timeline path -----------------------------------------------
+run_plaso() {
+    local plaso_storage
+    plaso_storage="$(mktemp -u).plaso"
+
+    log_info "Using log2timeline (Plaso) for timeline generation..."
+
+    # Build log2timeline command
+    local l2t_cmd=(log2timeline.py --status_view linear)
+    if [[ "$TIMELINE_TYPE" == "filesystem" ]]; then
+        l2t_cmd+=(--parsers "filestat")
+    fi
+    l2t_cmd+=("$plaso_storage" "$SOURCE")
+
+    log_info "Executing: ${l2t_cmd[*]}"
+    "${l2t_cmd[@]}" 2>&1 | while IFS= read -r line; do
+        [[ "$FORENSIC_VERBOSE" -eq 1 ]] && log_info "  [plaso] ${line}"
+    done
+
+    # Build psort command for output
+    local psort_cmd=(psort.py -o "$FORMAT")
+
+    # Date filters
+    if [[ -n "$START_DATE" ]]; then
+        psort_cmd+=(--slice "${START_DATE}")
+    fi
+
+    psort_cmd+=(-w "$OUTPUT" "$plaso_storage")
+
+    if [[ -n "$START_DATE" && -n "$END_DATE" ]]; then
+        psort_cmd=(psort.py -o "$FORMAT" -w "$OUTPUT" "$plaso_storage"
+            "date > '${START_DATE}' AND date < '${END_DATE}'")
+    fi
+
+    log_info "Executing: ${psort_cmd[*]}"
+    "${psort_cmd[@]}" 2>&1 | while IFS= read -r line; do
+        [[ "$FORENSIC_VERBOSE" -eq 1 ]] && log_info "  [psort] ${line}"
+    done
+
+    rm -f "$plaso_storage"
+}
+
+# ---- Sleuth Kit fls fallback -------------------------------------------------
+run_fls() {
+    log_info "Using fls (The Sleuth Kit) for filesystem timeline..."
+
+    if ! check_tool fls sleuthkit; then
+        log_error "Neither Plaso nor Sleuth Kit is available. Cannot proceed."
+        exit 1
+    fi
+    if ! check_tool mactime sleuthkit; then
+        log_error "mactime not found (part of Sleuth Kit)."
+        exit 1
+    fi
+
+    local bodyfile
+    bodyfile="$(mktemp)"
+
+    log_info "Generating body file with fls..."
+    fls -r -m "/" "$SOURCE" > "$bodyfile" 2>/dev/null || {
+        log_error "fls failed. Is the source a valid disk image?"
+        rm -f "$bodyfile"
+        exit 1
+    }
+
+    local body_lines
+    body_lines="$(wc -l < "$bodyfile")"
+    log_info "Body file contains ${body_lines} entries."
+
+    # Build mactime command
+    local mactime_cmd=(mactime -b "$bodyfile" -d)
+    if [[ -n "$START_DATE" ]]; then
+        mactime_cmd+=("$START_DATE")
+        if [[ -n "$END_DATE" ]]; then
+            mactime_cmd+=("$END_DATE")
+        fi
+    fi
+
+    case "$FORMAT" in
+        csv)
+            log_info "Generating CSV timeline..."
+            "${mactime_cmd[@]}" > "$OUTPUT" 2>/dev/null
+            ;;
+        json)
+            log_info "Generating JSON timeline (converting from CSV)..."
+            {
+                echo "["
+                local first=1
+                while IFS=',' read -r date size macb perms uid gid inode name; do
+                    [[ "$date" == "Date"* ]] && continue  # skip header
+                    if [[ "$first" -eq 1 ]]; then first=0; else echo ","; fi
+                    printf '  {"date":"%s","size":"%s","macb":"%s","perms":"%s","uid":"%s","gid":"%s","inode":"%s","name":"%s"}' \
+                        "$date" "$size" "$macb" "$perms" "$uid" "$gid" "$inode" "$name"
+                done < <("${mactime_cmd[@]}" 2>/dev/null)
+                echo ""
+                echo "]"
+            } > "$OUTPUT"
+            ;;
+        html)
+            log_info "Generating HTML timeline..."
+            {
+                cat <<'HTMLHEAD'
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>Forensic Timeline</title>
+<style>
+  body { font-family: monospace; margin: 20px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: left; }
+  th { background: #333; color: #fff; cursor: pointer; }
+  tr:nth-child(even) { background: #f4f4f4; }
+</style></head><body>
+<h1>Forensic Timeline</h1>
+<table><thead><tr>
+  <th>Date</th><th>Size</th><th>MACB</th><th>Perms</th>
+  <th>UID</th><th>GID</th><th>Inode</th><th>Name</th>
+</tr></thead><tbody>
+HTMLHEAD
+                while IFS=',' read -r date size macb perms uid gid inode name; do
+                    [[ "$date" == "Date"* ]] && continue
+                    printf '<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n' \
+                        "$date" "$size" "$macb" "$perms" "$uid" "$gid" "$inode" "$name"
+                done < <("${mactime_cmd[@]}" 2>/dev/null)
+                echo "</tbody></table></body></html>"
+            } > "$OUTPUT"
+            ;;
+    esac
+
+    rm -f "$bodyfile"
+}
+
+# ---- Select engine and run ---------------------------------------------------
+if check_tool log2timeline.py plaso 2>/dev/null; then
+    run_plaso
+else
+    log_warn "Plaso/log2timeline not found; falling back to Sleuth Kit (fls)."
+    run_fls
+fi
+
+END_TIME="$(date +%s)"
+ELAPSED=$(( END_TIME - START_TIME ))
+
+# ---- Report ------------------------------------------------------------------
+if [[ -f "$OUTPUT" ]]; then
+    OUTPUT_LINES="$(wc -l < "$OUTPUT")"
+    OUTPUT_SIZE="$(stat -c%s "$OUTPUT" 2>/dev/null || echo 0)"
+    log_success "Timeline generated: ${OUTPUT}"
+    log_info "  Lines    : ${OUTPUT_LINES}"
+    log_info "  Size     : $(format_size "$OUTPUT_SIZE")"
+    log_info "  Duration : ${ELAPSED}s"
+else
+    log_error "Output file was not created."
+    exit 1
+fi
+
+audit_log "Timeline complete: output=${OUTPUT} format=${FORMAT} lines=${OUTPUT_LINES} elapsed=${ELAPSED}s"

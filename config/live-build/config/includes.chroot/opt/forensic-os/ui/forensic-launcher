@@ -1,0 +1,380 @@
+#!/usr/bin/env bash
+#
+# forensic-launcher - ForensicOS Interactive CLI Menu Launcher
+#
+
+set -euo pipefail
+
+FORENSIC_ROOT="${FORENSIC_ROOT:-/home/user/Forensic_os}"
+TOOLS_DIR="${FORENSIC_ROOT}/tools"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Show ASCII banner
+show_banner() {
+    echo -e "${CYAN}"
+    cat <<'BANNER'
+    ___________                              .__        ________    _________
+    \_   _____/___  _______   ____    ____   |__|  ____ \_____  \  /   _____/
+     |    __) /  _ \ \_  __ \_/ __ \  /    \  |  | / ___\  /   |   \ \_____  \
+     |     \ (  <_> ) |  | \/\  ___/ |   |  \ |  |/ /__  /    |    \/        \
+     \___  /  \____/  |__|    \___  >|___|  / |__|\___  >\_______  /_______  /
+         \/                       \/      \/          \/         \/        \/
+BANNER
+    echo -e "${NC}"
+    echo -e "${BOLD}${BLUE}    Digital Forensic Examination Suite${NC}"
+    echo -e "${DIM}    $(date '+%Y-%m-%d %H:%M:%S %Z')${NC}"
+    echo ""
+    echo -e "    ${DIM}────────────────────────────────────────────────────────${NC}"
+    echo ""
+}
+
+# Show menu
+show_menu() {
+    echo -e "${BOLD}  Main Menu:${NC}"
+    echo ""
+    echo -e "    ${CYAN} 1)${NC}  New Case                ${CYAN} 7)${NC}  Memory Forensics"
+    echo -e "    ${CYAN} 2)${NC}  Acquire Disk Image       ${CYAN} 8)${NC}  Network Forensics"
+    echo -e "    ${CYAN} 3)${NC}  Mount Evidence            ${CYAN} 9)${NC}  Log Analysis"
+    echo -e "    ${CYAN} 4)${NC}  Hash Verification         ${CYAN}10)${NC}  Generate Report"
+    echo -e "    ${CYAN} 5)${NC}  File Carving              ${CYAN}11)${NC}  Case Status"
+    echo -e "    ${CYAN} 6)${NC}  Timeline Analysis"
+    echo ""
+    echo -e "    ${RED} 0)${NC}  Exit"
+    echo ""
+}
+
+prompt_input() {
+    local prompt="$1"
+    local var_name="$2"
+    local default="${3:-}"
+    local display_prompt="$prompt"
+    [[ -n "$default" ]] && display_prompt="${prompt} [${default}]"
+    read -rp "  ${display_prompt}: " value
+    [[ -z "$value" ]] && value="$default"
+    eval "$var_name=\"$value\""
+}
+
+pause() {
+    echo ""
+    read -rp "  Press Enter to continue..."
+}
+
+# Menu actions
+action_new_case() {
+    echo -e "\n${BOLD}=== New Forensic Case ===${NC}\n"
+    local case_num examiner description
+    prompt_input "Case number (leave blank to auto-generate)" case_num
+    prompt_input "Examiner name" examiner "$(whoami)"
+    prompt_input "Case description" description
+
+    local args=()
+    [[ -n "$case_num" ]] && args+=(-n "$case_num")
+    [[ -n "$examiner" ]] && args+=(-e "$examiner")
+    [[ -n "$description" ]] && args+=(-d "$description")
+
+    echo ""
+    "${TOOLS_DIR}/forensic-case" init "${args[@]}"
+}
+
+action_acquire_image() {
+    echo -e "\n${BOLD}=== Acquire Disk Image ===${NC}\n"
+    prompt_input "Source device (e.g., /dev/sdb)" source_dev
+    prompt_input "Destination path for image" dest_path
+    prompt_input "Image format (raw/ewf)" img_format "raw"
+
+    if [[ -z "$source_dev" || -z "$dest_path" ]]; then
+        echo -e "${RED}  Source and destination are required.${NC}"
+        return
+    fi
+
+    echo ""
+    echo -e "${YELLOW}  This will create a forensic image of ${source_dev}${NC}"
+    read -rp "  Proceed? (y/N): " confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+
+    if [[ "$img_format" == "ewf" ]] && command -v ewfacquire &>/dev/null; then
+        echo -e "${GREEN}  Starting EWF acquisition...${NC}"
+        sudo ewfacquire -t "$dest_path" -u "$source_dev"
+    elif command -v dc3dd &>/dev/null; then
+        echo -e "${GREEN}  Starting dc3dd acquisition...${NC}"
+        sudo dc3dd if="$source_dev" of="$dest_path" hash=sha256 log="${dest_path}.log"
+    elif command -v dcfldd &>/dev/null; then
+        echo -e "${GREEN}  Starting dcfldd acquisition...${NC}"
+        sudo dcfldd if="$source_dev" of="$dest_path" hash=sha256 hashlog="${dest_path}.hash"
+    else
+        echo -e "${GREEN}  Starting dd acquisition...${NC}"
+        sudo dd if="$source_dev" of="$dest_path" bs=4M status=progress conv=noerror,sync
+        echo -e "  Computing SHA-256..."
+        sha256sum "$dest_path" | tee "${dest_path}.sha256"
+    fi
+    echo -e "${GREEN}  Acquisition complete.${NC}"
+}
+
+action_mount_evidence() {
+    echo -e "\n${BOLD}=== Mount Evidence (Read-Only) ===${NC}\n"
+    prompt_input "Image file path" img_path
+    prompt_input "Mount point" mount_point "/mnt/evidence"
+
+    if [[ -z "$img_path" ]]; then
+        echo -e "${RED}  Image path is required.${NC}"
+        return
+    fi
+
+    echo ""
+    sudo mkdir -p "$mount_point"
+    echo -e "${GREEN}  Mounting ${img_path} read-only at ${mount_point}...${NC}"
+    sudo mount -o ro,loop,noexec,nosuid,nodev "$img_path" "$mount_point" 2>/dev/null && \
+        echo -e "${GREEN}  Mounted successfully.${NC}" || \
+        echo -e "${RED}  Mount failed. Check image format and path.${NC}"
+}
+
+action_hash_verify() {
+    echo -e "\n${BOLD}=== Hash Verification ===${NC}\n"
+    prompt_input "File to hash" hash_file
+    prompt_input "Algorithm (md5/sha1/sha256)" hash_algo "sha256"
+    prompt_input "Expected hash (leave blank to just compute)" expected_hash
+
+    if [[ -z "$hash_file" || ! -f "$hash_file" ]]; then
+        echo -e "${RED}  File not found: ${hash_file}${NC}"
+        return
+    fi
+
+    echo -e "\n  Computing ${hash_algo} hash..."
+    local computed
+    case "$hash_algo" in
+        md5)    computed=$(md5sum "$hash_file" | awk '{print $1}') ;;
+        sha1)   computed=$(sha1sum "$hash_file" | awk '{print $1}') ;;
+        sha256) computed=$(sha256sum "$hash_file" | awk '{print $1}') ;;
+        *)      echo -e "${RED}  Unsupported algorithm.${NC}"; return ;;
+    esac
+
+    echo -e "  ${BOLD}${hash_algo^^}: ${computed}${NC}"
+
+    if [[ -n "$expected_hash" ]]; then
+        if [[ "${computed,,}" == "${expected_hash,,}" ]]; then
+            echo -e "  ${GREEN}MATCH - Integrity verified.${NC}"
+        else
+            echo -e "  ${RED}MISMATCH - Integrity check FAILED!${NC}"
+            echo -e "  ${RED}Expected: ${expected_hash}${NC}"
+        fi
+    fi
+}
+
+action_file_carving() {
+    echo -e "\n${BOLD}=== File Carving ===${NC}\n"
+    prompt_input "Source image/device" carve_source
+    prompt_input "Output directory" carve_output "./carved_files"
+
+    if [[ -z "$carve_source" ]]; then
+        echo -e "${RED}  Source is required.${NC}"
+        return
+    fi
+
+    mkdir -p "$carve_output"
+
+    if command -v scalpel &>/dev/null; then
+        echo -e "${GREEN}  Running scalpel...${NC}"
+        scalpel "$carve_source" -o "$carve_output"
+    elif command -v foremost &>/dev/null; then
+        echo -e "${GREEN}  Running foremost...${NC}"
+        foremost -i "$carve_source" -o "$carve_output"
+    elif command -v photorec &>/dev/null; then
+        echo -e "${GREEN}  Running photorec...${NC}"
+        photorec /d "$carve_output" "$carve_source"
+    else
+        echo -e "${RED}  No carving tool found. Install scalpel, foremost, or photorec.${NC}"
+        return
+    fi
+    echo -e "${GREEN}  Carving complete. Results in: ${carve_output}${NC}"
+}
+
+action_timeline() {
+    echo -e "\n${BOLD}=== Timeline Analysis ===${NC}\n"
+    prompt_input "Mount point or image path" tl_source
+    prompt_input "Output file" tl_output "./timeline.csv"
+
+    if [[ -z "$tl_source" ]]; then
+        echo -e "${RED}  Source is required.${NC}"
+        return
+    fi
+
+    if command -v fls &>/dev/null; then
+        echo -e "${GREEN}  Running Sleuth Kit timeline (fls + mactime)...${NC}"
+        local bodyfile="/tmp/forensic_bodyfile_$$.txt"
+        fls -r -m "/" "$tl_source" > "$bodyfile" 2>/dev/null || true
+        if command -v mactime &>/dev/null; then
+            mactime -b "$bodyfile" -d > "$tl_output" 2>/dev/null
+            echo -e "${GREEN}  Timeline saved to: ${tl_output}${NC}"
+        else
+            echo -e "${YELLOW}  mactime not found. Body file saved to: ${bodyfile}${NC}"
+        fi
+    elif command -v log2timeline.py &>/dev/null; then
+        echo -e "${GREEN}  Running plaso (log2timeline)...${NC}"
+        log2timeline.py --storage-file /tmp/plaso_$$.dump "$tl_source"
+        psort.py -o l2tcsv -w "$tl_output" /tmp/plaso_$$.dump 2>/dev/null
+        echo -e "${GREEN}  Timeline saved to: ${tl_output}${NC}"
+    else
+        echo -e "${RED}  No timeline tool found. Install sleuthkit or plaso.${NC}"
+    fi
+}
+
+action_memory_forensics() {
+    echo -e "\n${BOLD}=== Memory Forensics ===${NC}\n"
+    prompt_input "Memory dump file" mem_file
+    prompt_input "Profile (leave blank for auto-detect)" mem_profile
+
+    if [[ -z "$mem_file" ]]; then
+        echo -e "${RED}  Memory dump file is required.${NC}"
+        return
+    fi
+
+    if command -v vol.py &>/dev/null; then
+        local vol_cmd="vol.py"
+    elif command -v volatility3 &>/dev/null; then
+        local vol_cmd="volatility3"
+    elif command -v vol &>/dev/null; then
+        local vol_cmd="vol"
+    else
+        echo -e "${RED}  Volatility not found. Install volatility3.${NC}"
+        return
+    fi
+
+    echo -e "${GREEN}  Running Volatility analysis...${NC}"
+
+    if [[ "$vol_cmd" == "vol.py" || "$vol_cmd" == "vol" ]]; then
+        echo -e "\n${BOLD}  Process List:${NC}"
+        $vol_cmd -f "$mem_file" ${mem_profile:+--profile="$mem_profile"} pslist 2>/dev/null || true
+
+        echo -e "\n${BOLD}  Network Connections:${NC}"
+        $vol_cmd -f "$mem_file" ${mem_profile:+--profile="$mem_profile"} netscan 2>/dev/null || true
+    else
+        echo -e "\n${BOLD}  Process List:${NC}"
+        $vol_cmd -f "$mem_file" windows.pslist 2>/dev/null || \
+        $vol_cmd -f "$mem_file" linux.pslist 2>/dev/null || true
+
+        echo -e "\n${BOLD}  Network Connections:${NC}"
+        $vol_cmd -f "$mem_file" windows.netscan 2>/dev/null || \
+        $vol_cmd -f "$mem_file" linux.sockstat 2>/dev/null || true
+    fi
+}
+
+action_network_forensics() {
+    echo -e "\n${BOLD}=== Network Forensics ===${NC}\n"
+    prompt_input "PCAP file path" pcap_file
+
+    if [[ -z "$pcap_file" || ! -f "$pcap_file" ]]; then
+        echo -e "${RED}  PCAP file not found.${NC}"
+        return
+    fi
+
+    if command -v tshark &>/dev/null; then
+        echo -e "${BOLD}  Protocol Hierarchy:${NC}"
+        tshark -r "$pcap_file" -q -z io,phs 2>/dev/null || true
+
+        echo -e "\n${BOLD}  Conversations:${NC}"
+        tshark -r "$pcap_file" -q -z conv,tcp 2>/dev/null | head -30 || true
+
+        echo -e "\n${BOLD}  DNS Queries:${NC}"
+        tshark -r "$pcap_file" -Y "dns.qr==0" -T fields -e dns.qry.name 2>/dev/null | sort -u | head -30 || true
+
+        echo -e "\n${BOLD}  HTTP Requests:${NC}"
+        tshark -r "$pcap_file" -Y "http.request" -T fields -e http.request.method -e http.host -e http.request.uri 2>/dev/null | head -30 || true
+    elif command -v tcpdump &>/dev/null; then
+        echo -e "${GREEN}  Analyzing with tcpdump...${NC}"
+        tcpdump -r "$pcap_file" -nn 2>/dev/null | head -50
+    else
+        echo -e "${RED}  No network analysis tool found. Install wireshark-cli or tcpdump.${NC}"
+    fi
+}
+
+action_log_analysis() {
+    echo -e "\n${BOLD}=== Log Analysis ===${NC}\n"
+    prompt_input "Log file or directory" log_source
+    prompt_input "Search pattern (regex)" log_pattern
+
+    if [[ -z "$log_source" ]]; then
+        echo -e "${RED}  Log source is required.${NC}"
+        return
+    fi
+
+    if [[ -d "$log_source" ]]; then
+        echo -e "${GREEN}  Searching directory: ${log_source}${NC}\n"
+        if [[ -n "$log_pattern" ]]; then
+            grep -rn --color=always "$log_pattern" "$log_source" 2>/dev/null | head -100
+        else
+            echo -e "  Log files found:"
+            find "$log_source" -type f \( -name "*.log" -o -name "*.txt" -o -name "*.evtx" \) 2>/dev/null | head -50
+        fi
+    elif [[ -f "$log_source" ]]; then
+        if [[ -n "$log_pattern" ]]; then
+            echo -e "${GREEN}  Searching for '${log_pattern}' in ${log_source}:${NC}\n"
+            grep -n --color=always "$log_pattern" "$log_source" 2>/dev/null | head -100
+        else
+            echo -e "${GREEN}  Last 50 entries from ${log_source}:${NC}\n"
+            tail -50 "$log_source"
+        fi
+    else
+        echo -e "${RED}  Source not found: ${log_source}${NC}"
+    fi
+}
+
+action_generate_report() {
+    echo -e "\n${BOLD}=== Generate Forensic Report ===${NC}\n"
+    prompt_input "Format (html/pdf)" report_format "html"
+    prompt_input "Output file (leave blank for default)" report_output
+
+    local args=(generate -f "$report_format")
+    [[ -n "$report_output" ]] && args+=(-o "$report_output")
+
+    "${TOOLS_DIR}/forensic-report" "${args[@]}"
+}
+
+action_case_status() {
+    "${TOOLS_DIR}/forensic-case" status 2>/dev/null || true
+    echo ""
+    "${TOOLS_DIR}/forensic-report" summary 2>/dev/null || true
+}
+
+# Main loop
+clear
+show_banner
+
+while true; do
+    show_menu
+    read -rp "  ${BOLD}Select option [0-11]:${NC} " choice
+    echo ""
+
+    case "$choice" in
+        1)  action_new_case ;;
+        2)  action_acquire_image ;;
+        3)  action_mount_evidence ;;
+        4)  action_hash_verify ;;
+        5)  action_file_carving ;;
+        6)  action_timeline ;;
+        7)  action_memory_forensics ;;
+        8)  action_network_forensics ;;
+        9)  action_log_analysis ;;
+        10) action_generate_report ;;
+        11) action_case_status ;;
+        0)
+            echo -e "  ${GREEN}Exiting ForensicOS. Stay forensic.${NC}\n"
+            exit 0
+            ;;
+        *)
+            echo -e "  ${RED}Invalid option. Please select 0-11.${NC}"
+            ;;
+    esac
+
+    pause
+    echo ""
+done

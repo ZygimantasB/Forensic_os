@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=ForensicOS Toolkit
+Comment=Digital Forensics Investigation Toolkit
+Exec=/opt/forensic-os/ui/forensic-gui
+Icon=/opt/forensic-os/ui/desktop/icons/forensic-os.png
+Terminal=false
+Categories=System;Security;
+Keywords=forensics;investigation;imaging;evidence;
+StartupNotify=true

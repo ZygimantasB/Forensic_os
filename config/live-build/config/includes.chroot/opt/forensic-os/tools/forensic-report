@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+#
+# forensic-report - ForensicOS Report Generation Tool
+# Usage: forensic-report generate [-c case_dir] [-f html|pdf] [-o output] | summary [-c case_dir]
+#
+
+set -euo pipefail
+
+FORENSIC_CASES_DIR="${FORENSIC_CASES_DIR:-/home/user/Forensic_os/cases}"
+TEMPLATE_DIR="${TEMPLATE_DIR:-/home/user/Forensic_os/templates}"
+CURRENT_CASE_FILE="${FORENSIC_CASES_DIR}/.current_case"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+usage() {
+    cat <<'EOF'
+Usage: forensic-report <command> [options]
+
+Commands:
+  generate   Generate a forensic report
+  summary    Print quick case summary to terminal
+
+Options:
+  -c CASE_DIR   Path to case directory (defaults to active case)
+  -f FORMAT     Output format: html or pdf (default: html)
+  -o OUTPUT     Output file path (default: case_dir/reports/report.<format>)
+
+Examples:
+  forensic-report generate
+  forensic-report generate -c /path/to/case -f pdf -o report.pdf
+  forensic-report summary
+  forensic-report summary -c /path/to/case
+EOF
+    exit 1
+}
+
+# Resolve case directory
+resolve_case_dir() {
+    local case_dir="$1"
+    if [[ -n "$case_dir" && -d "$case_dir" ]]; then
+        echo "$case_dir"
+        return 0
+    fi
+    if [[ -f "$CURRENT_CASE_FILE" ]]; then
+        local cn
+        cn=$(cat "$CURRENT_CASE_FILE")
+        local dir="${FORENSIC_CASES_DIR}/${cn}"
+        if [[ -d "$dir" ]]; then
+            echo "$dir"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Read a JSON field from case.json
+read_case_field() {
+    local case_json="$1"
+    local field="$2"
+    python3 -c "import json; print(json.load(open('${case_json}')).get('${field}', 'N/A'))" 2>/dev/null || echo "N/A"
+}
+
+# Build evidence table HTML rows
+build_evidence_table() {
+    local evidence_dir="$1"
+    local rows=""
+
+    if [[ ! -d "$evidence_dir" ]]; then
+        echo "<tr><td colspan='4'>No evidence items found.</td></tr>"
+        return
+    fi
+
+    local count=0
+    while IFS= read -r -d '' efile; do
+        count=$((count + 1))
+        local fname fsize fhash
+        fname=$(basename "$efile")
+        fsize=$(stat --format='%s' "$efile" 2>/dev/null || echo "0")
+        fhash=$(sha256sum "$efile" 2>/dev/null | awk '{print $1}' || echo "N/A")
+
+        # Human-readable size
+        local hr_size
+        if [[ $fsize -ge 1073741824 ]]; then
+            hr_size="$(awk "BEGIN {printf \"%.2f GB\", ${fsize}/1073741824}")"
+        elif [[ $fsize -ge 1048576 ]]; then
+            hr_size="$(awk "BEGIN {printf \"%.2f MB\", ${fsize}/1048576}")"
+        elif [[ $fsize -ge 1024 ]]; then
+            hr_size="$(awk "BEGIN {printf \"%.2f KB\", ${fsize}/1024}")"
+        else
+            hr_size="${fsize} B"
+        fi
+
+        rows+="<tr><td>${count}</td><td>${fname}</td><td>${hr_size}</td><td><code>${fhash}</code></td></tr>"
+    done < <(find "$evidence_dir" -maxdepth 1 -type f -print0 2>/dev/null)
+
+    if [[ $count -eq 0 ]]; then
+        echo "<tr><td colspan='4'>No evidence items found.</td></tr>"
+    else
+        echo "$rows"
+    fi
+}
+
+# Build timeline from chain-of-custody log
+build_timeline_html() {
+    local coc_file="$1"
+    local rows=""
+
+    if [[ ! -f "$coc_file" ]]; then
+        echo "<tr><td colspan='4'>No timeline entries.</td></tr>"
+        return
+    fi
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local ts action item handler notes
+        ts=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['timestamp'])" 2>/dev/null || echo "")
+        action=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['action'])" 2>/dev/null || echo "")
+        item=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['item'])" 2>/dev/null || echo "")
+        handler=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['handler'])" 2>/dev/null || echo "")
+        notes=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['notes'])" 2>/dev/null || echo "")
+
+        rows+="<tr><td>${ts}</td><td>${action}</td><td>${item}</td><td>${handler}</td><td>${notes}</td></tr>"
+    done < "$coc_file"
+
+    if [[ -z "$rows" ]]; then
+        echo "<tr><td colspan='5'>No timeline entries.</td></tr>"
+    else
+        echo "$rows"
+    fi
+}
+
+# Build chain-of-custody HTML table
+build_coc_html() {
+    local coc_file="$1"
+    if [[ ! -f "$coc_file" ]]; then
+        echo "<tr><td colspan='7'>No chain-of-custody records.</td></tr>"
+        return
+    fi
+
+    local rows=""
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local ts action item handler from_f to_f notes
+        ts=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['timestamp'])" 2>/dev/null || echo "")
+        action=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['action'])" 2>/dev/null || echo "")
+        item=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['item'])" 2>/dev/null || echo "")
+        handler=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['handler'])" 2>/dev/null || echo "")
+        from_f=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('from',''))" 2>/dev/null || echo "")
+        to_f=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('to',''))" 2>/dev/null || echo "")
+        notes=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('notes',''))" 2>/dev/null || echo "")
+
+        rows+="<tr><td>${ts}</td><td>${action}</td><td>${item}</td><td>${handler}</td><td>${from_f}</td><td>${to_f}</td><td>${notes}</td></tr>"
+    done < "$coc_file"
+
+    [[ -z "$rows" ]] && rows="<tr><td colspan='7'>No chain-of-custody records.</td></tr>"
+    echo "$rows"
+}
+
+# Generate report
+cmd_generate() {
+    local case_dir=""
+    local format="html"
+    local output=""
+
+    while getopts "c:f:o:" opt; do
+        case "$opt" in
+            c) case_dir="$OPTARG" ;;
+            f) format="$OPTARG" ;;
+            o) output="$OPTARG" ;;
+            *) usage ;;
+        esac
+    done
+
+    case_dir=$(resolve_case_dir "$case_dir") || {
+        log_error "No case directory found. Specify with -c or set an active case."
+        exit 1
+    }
+
+    local case_json="${case_dir}/case.json"
+    if [[ ! -f "$case_json" ]]; then
+        log_error "case.json not found in ${case_dir}"
+        exit 1
+    fi
+
+    local template="${TEMPLATE_DIR}/report-template.html"
+    if [[ ! -f "$template" ]]; then
+        log_error "Report template not found: ${template}"
+        exit 1
+    fi
+
+    # Read case metadata
+    local case_number examiner created description status
+    case_number=$(read_case_field "$case_json" "case_number")
+    examiner=$(read_case_field "$case_json" "examiner")
+    created=$(read_case_field "$case_json" "created")
+    description=$(read_case_field "$case_json" "description")
+    status=$(read_case_field "$case_json" "status")
+
+    local report_date
+    report_date=$(date +"%Y-%m-%d %H:%M:%S %Z")
+
+    # Build dynamic sections
+    local evidence_rows timeline_rows coc_rows
+    evidence_rows=$(build_evidence_table "${case_dir}/evidence")
+    timeline_rows=$(build_timeline_html "${case_dir}/logs/chain-of-custody.jsonl")
+    coc_rows=$(build_coc_html "${case_dir}/logs/chain-of-custody.jsonl")
+
+    # Read examiner notes
+    local notes_content="No examiner notes recorded."
+    if [[ -d "${case_dir}/notes" ]]; then
+        local note_files
+        note_files=$(find "${case_dir}/notes" -type f -name "*.txt" -o -name "*.md" 2>/dev/null)
+        if [[ -n "$note_files" ]]; then
+            notes_content=""
+            while IFS= read -r nf; do
+                notes_content+="<h4>$(basename "$nf")</h4><pre>$(cat "$nf")</pre>"
+            done <<< "$note_files"
+        fi
+    fi
+
+    # Default output path
+    if [[ -z "$output" ]]; then
+        output="${case_dir}/reports/forensic-report-${case_number}.${format}"
+    fi
+
+    log_info "Generating ${format^^} report for case ${case_number}..."
+
+    # Generate HTML by substituting template placeholders
+    local html_content
+    html_content=$(cat "$template")
+    html_content="${html_content//\{\{CASE_NUMBER\}\}/$case_number}"
+    html_content="${html_content//\{\{EXAMINER\}\}/$examiner}"
+    html_content="${html_content//\{\{DATE\}\}/$report_date}"
+    html_content="${html_content//\{\{CREATED_DATE\}\}/$created}"
+    html_content="${html_content//\{\{DESCRIPTION\}\}/$description}"
+    html_content="${html_content//\{\{STATUS\}\}/$status}"
+    html_content="${html_content//\{\{EVIDENCE_ROWS\}\}/$evidence_rows}"
+    html_content="${html_content//\{\{TIMELINE_ROWS\}\}/$timeline_rows}"
+    html_content="${html_content//\{\{COC_ROWS\}\}/$coc_rows}"
+    html_content="${html_content//\{\{FINDINGS\}\}/$notes_content}"
+    html_content="${html_content//\{\{AGENCY\}\}/ForensicOS Digital Forensics Lab}"
+
+    if [[ "$format" == "html" ]]; then
+        echo "$html_content" > "$output"
+        log_info "HTML report generated: ${output}"
+    elif [[ "$format" == "pdf" ]]; then
+        local html_tmp
+        html_tmp=$(mktemp /tmp/forensic-report-XXXXXX.html)
+        echo "$html_content" > "$html_tmp"
+
+        if command -v wkhtmltopdf &>/dev/null; then
+            wkhtmltopdf --quiet --enable-local-file-access "$html_tmp" "$output" 2>/dev/null
+            log_info "PDF report generated: ${output}"
+        elif command -v weasyprint &>/dev/null; then
+            weasyprint "$html_tmp" "$output" 2>/dev/null
+            log_info "PDF report generated (via weasyprint): ${output}"
+        else
+            log_warn "No PDF converter found (wkhtmltopdf or weasyprint). Saving as HTML."
+            output="${output%.pdf}.html"
+            cp "$html_tmp" "$output"
+            log_info "HTML report saved: ${output}"
+        fi
+        rm -f "$html_tmp"
+    else
+        log_error "Unsupported format: ${format}. Use 'html' or 'pdf'."
+        exit 1
+    fi
+
+    echo -e "\n${GREEN}Report saved to: ${output}${NC}\n"
+}
+
+# Print quick summary
+cmd_summary() {
+    local case_dir=""
+
+    while getopts "c:" opt; do
+        case "$opt" in
+            c) case_dir="$OPTARG" ;;
+            *) usage ;;
+        esac
+    done
+
+    case_dir=$(resolve_case_dir "$case_dir") || {
+        log_error "No case directory found. Specify with -c or set an active case."
+        exit 1
+    }
+
+    local case_json="${case_dir}/case.json"
+    if [[ ! -f "$case_json" ]]; then
+        log_error "case.json not found in ${case_dir}"
+        exit 1
+    fi
+
+    local case_number examiner created description status
+    case_number=$(read_case_field "$case_json" "case_number")
+    examiner=$(read_case_field "$case_json" "examiner")
+    created=$(read_case_field "$case_json" "created")
+    description=$(read_case_field "$case_json" "description")
+    status=$(read_case_field "$case_json" "status")
+
+    # Count evidence
+    local evidence_count=0
+    if [[ -d "${case_dir}/evidence" ]]; then
+        evidence_count=$(find "${case_dir}/evidence" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    fi
+
+    # Count CoC entries
+    local coc_count=0
+    local coc_file="${case_dir}/logs/chain-of-custody.jsonl"
+    [[ -f "$coc_file" ]] && coc_count=$(wc -l < "$coc_file")
+
+    # Count reports
+    local report_count=0
+    if [[ -d "${case_dir}/reports" ]]; then
+        report_count=$(find "${case_dir}/reports" -type f 2>/dev/null | wc -l)
+    fi
+
+    local status_color="$GREEN"
+    [[ "$status" == "closed" ]] && status_color="$RED"
+
+    echo ""
+    echo -e "${BOLD}===============================================${NC}"
+    echo -e "${BOLD}         FORENSIC CASE SUMMARY${NC}"
+    echo -e "${BOLD}===============================================${NC}"
+    echo ""
+    echo -e "  Case Number     : ${CYAN}${case_number}${NC}"
+    echo -e "  Status          : ${status_color}${status^^}${NC}"
+    echo -e "  Examiner        : ${examiner}"
+    echo -e "  Date Created    : ${created}"
+    echo -e "  Description     : ${description}"
+    echo ""
+    echo -e "  Evidence Items  : ${evidence_count}"
+    echo -e "  CoC Entries     : ${coc_count}"
+    echo -e "  Reports         : ${report_count}"
+    echo ""
+    echo -e "  Case Directory  : ${case_dir}"
+    echo -e "${BOLD}===============================================${NC}"
+    echo ""
+
+    # Show recent chain-of-custody activity
+    if [[ -f "$coc_file" ]] && [[ $coc_count -gt 0 ]]; then
+        echo -e "${BOLD}  Recent Activity:${NC}"
+        tail -5 "$coc_file" | while IFS= read -r line; do
+            local ts action
+            ts=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['timestamp'])" 2>/dev/null || echo "?")
+            action=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['action'])" 2>/dev/null || echo "?")
+            echo -e "    ${ts}  ${action}"
+        done
+        echo ""
+    fi
+}
+
+# Main
+if [[ $# -lt 1 ]]; then
+    usage
+fi
+
+command="$1"
+shift
+
+case "$command" in
+    generate) cmd_generate "$@" ;;
+    summary)  cmd_summary "$@" ;;
+    -h|--help) usage ;;
+    *)
+        log_error "Unknown command: ${command}"
+        usage
+        ;;
+esac

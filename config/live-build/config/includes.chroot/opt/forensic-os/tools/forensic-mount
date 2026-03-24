@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# =============================================================================
+# forensic-mount - Safe read-only evidence mounting
+# =============================================================================
+# Mounts evidence devices and image files in a forensically-sound manner:
+# always read-only with noexec, nosuid, nodev. Logs every mount/unmount
+# operation to the audit trail.
+# =============================================================================
+set -euo pipefail
+
+FORENSIC_TOOL_NAME="forensic-mount"
+
+# ---- Source common library ---------------------------------------------------
+if [[ -f /opt/forensic-os/lib/forensic-common.sh ]]; then
+    source /opt/forensic-os/lib/forensic-common.sh
+elif [[ -f "$(dirname "$0")/../lib/forensic-common.sh" ]]; then
+    source "$(dirname "$0")/../lib/forensic-common.sh"
+else
+    echo "FATAL: forensic-common.sh not found." >&2
+    exit 1
+fi
+
+# ---- Constants ---------------------------------------------------------------
+SAFE_MOUNT_OPTS="ro,noexec,nosuid,nodev"
+DEFAULT_MOUNTPOINT="/mnt/evidence"
+
+# ---- Usage -------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${BOLD}Usage:${NC} forensic-mount [OPTIONS]
+
+${BOLD}Options:${NC}
+  -s SOURCE      Source device or image file to mount (required for mount)
+  -m MOUNTPOINT  Mount point (default: ${DEFAULT_MOUNTPOINT})
+  -t FSTYPE      Filesystem type: auto (default), ntfs, ext4, xfs, vfat, etc.
+  -l             List currently mounted evidence volumes
+  -u MOUNTPOINT  Unmount evidence at mountpoint
+  -c CASE_DIR    Case directory (overrides FORENSIC_CASE_DIR)
+  -v             Verbose output
+  -h             Show this help
+
+${BOLD}Examples:${NC}
+  forensic-mount -s /dev/sdb1 -m /mnt/evidence/disk1
+  forensic-mount -s case001/disk.img -m /mnt/evidence/img1
+  forensic-mount -l
+  forensic-mount -u /mnt/evidence/disk1
+EOF
+    exit "${1:-0}"
+}
+
+# ---- Argument Parsing --------------------------------------------------------
+SOURCE=""
+MOUNTPOINT=""
+FSTYPE="auto"
+LIST_MODE=0
+UNMOUNT_TARGET=""
+
+while getopts ":s:m:t:lu:c:vh" opt; do
+    case "$opt" in
+        s) SOURCE="$OPTARG" ;;
+        m) MOUNTPOINT="$OPTARG" ;;
+        t) FSTYPE="$OPTARG" ;;
+        l) LIST_MODE=1 ;;
+        u) UNMOUNT_TARGET="$OPTARG" ;;
+        c) FORENSIC_CASE_DIR="$OPTARG" ;;
+        v) FORENSIC_VERBOSE=1 ;;
+        h) usage 0 ;;
+        :) log_error "Option -${OPTARG} requires an argument."; usage 1 ;;
+        *) log_error "Unknown option: -${OPTARG}"; usage 1 ;;
+    esac
+done
+
+# ---- List Mode ---------------------------------------------------------------
+if [[ "$LIST_MODE" -eq 1 ]]; then
+    log_info "Currently mounted evidence volumes (read-only mounts):"
+    echo ""
+    printf "${BOLD}%-40s %-30s %-10s %s${NC}\n" "SOURCE" "MOUNTPOINT" "FSTYPE" "OPTIONS"
+    echo "--------------------------------------------------------------------------------------------"
+    # Show all ro mounts, filtering to likely evidence paths
+    while IFS= read -r line; do
+        dev="$(echo "$line" | awk '{print $1}')"
+        mnt="$(echo "$line" | awk '{print $3}')"
+        fst="$(echo "$line" | awk '{print $5}')"
+        opts="$(echo "$line" | awk -F'[()]' '{print $2}')"
+        if [[ "$opts" == *"ro"* ]]; then
+            printf "%-40s %-30s %-10s %s\n" "$dev" "$mnt" "$fst" "$opts"
+        fi
+    done < /proc/mounts
+    echo ""
+    exit 0
+fi
+
+# ---- Unmount Mode ------------------------------------------------------------
+if [[ -n "$UNMOUNT_TARGET" ]]; then
+    require_root
+    if ! mountpoint -q "$UNMOUNT_TARGET" 2>/dev/null; then
+        log_error "${UNMOUNT_TARGET} is not a mountpoint."
+        exit 1
+    fi
+    log_info "Unmounting: ${UNMOUNT_TARGET}"
+    audit_log "Unmounting evidence: mountpoint=${UNMOUNT_TARGET}"
+
+    umount "$UNMOUNT_TARGET" || {
+        log_warn "Standard unmount failed, trying lazy unmount..."
+        umount -l "$UNMOUNT_TARGET"
+    }
+
+    log_success "Unmounted: ${UNMOUNT_TARGET}"
+    audit_log "Unmount complete: mountpoint=${UNMOUNT_TARGET}"
+
+    # Clean up empty directory
+    if [[ -d "$UNMOUNT_TARGET" ]] && [[ -z "$(ls -A "$UNMOUNT_TARGET" 2>/dev/null)" ]]; then
+        rmdir "$UNMOUNT_TARGET" 2>/dev/null && \
+            log_info "Removed empty mount directory: ${UNMOUNT_TARGET}"
+    fi
+    exit 0
+fi
+
+# ---- Mount Mode: Validation --------------------------------------------------
+if [[ -z "$SOURCE" ]]; then
+    log_error "Source (-s) is required for mounting. Use -l to list or -u to unmount."
+    usage 1
+fi
+
+require_root
+
+if [[ ! -e "$SOURCE" ]]; then
+    log_error "Source does not exist: ${SOURCE}"
+    exit 1
+fi
+
+# Determine if source is an image file (needs loop mount)
+IS_IMAGE=0
+if [[ -f "$SOURCE" ]]; then
+    IS_IMAGE=1
+fi
+
+# Default mount point
+if [[ -z "$MOUNTPOINT" ]]; then
+    MOUNTPOINT="${DEFAULT_MOUNTPOINT}/$(basename "$SOURCE" | sed 's/[^a-zA-Z0-9._-]/_/g')"
+fi
+
+# Create mount point
+if [[ ! -d "$MOUNTPOINT" ]]; then
+    mkdir -p "$MOUNTPOINT" || {
+        log_error "Cannot create mount point: ${MOUNTPOINT}"
+        exit 1
+    }
+fi
+
+# Check if already mounted
+if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
+    log_error "Something is already mounted at ${MOUNTPOINT}. Unmount first with -u."
+    exit 1
+fi
+
+# ---- Mount -------------------------------------------------------------------
+log_info "Forensic Mount Session"
+log_info "  Source     : ${SOURCE}"
+log_info "  Mountpoint : ${MOUNTPOINT}"
+log_info "  Filesystem : ${FSTYPE}"
+log_info "  Options    : ${SAFE_MOUNT_OPTS}"
+log_info "  Image file : $(if [[ $IS_IMAGE -eq 1 ]]; then echo yes; else echo no; fi)"
+
+audit_log "Mounting evidence: source=${SOURCE} mountpoint=${MOUNTPOINT} fstype=${FSTYPE} opts=${SAFE_MOUNT_OPTS}"
+
+MOUNT_CMD=(mount -o "$SAFE_MOUNT_OPTS")
+
+if [[ "$IS_IMAGE" -eq 1 ]]; then
+    MOUNT_CMD+=(-o "loop,${SAFE_MOUNT_OPTS}")
+    # Override the first -o
+    MOUNT_CMD=(mount -o "loop,${SAFE_MOUNT_OPTS}")
+fi
+
+if [[ "$FSTYPE" != "auto" ]]; then
+    MOUNT_CMD+=(-t "$FSTYPE")
+fi
+
+MOUNT_CMD+=("$SOURCE" "$MOUNTPOINT")
+
+log_info "Executing: ${MOUNT_CMD[*]}"
+
+if "${MOUNT_CMD[@]}"; then
+    log_success "Evidence mounted successfully."
+    log_success "  ${SOURCE} -> ${MOUNTPOINT}"
+
+    # Display mount verification
+    ACTUAL_OPTS="$(grep " ${MOUNTPOINT} " /proc/mounts 2>/dev/null | awk -F'[()]' '{print $2}' || echo "unknown")"
+    log_info "  Verified mount options: ${ACTUAL_OPTS}"
+
+    # Verify read-only
+    if echo "$ACTUAL_OPTS" | grep -q "ro"; then
+        log_success "  Confirmed: mount is READ-ONLY."
+    else
+        log_error "  WARNING: mount does not appear to be read-only! Unmounting for safety."
+        umount "$MOUNTPOINT" 2>/dev/null
+        exit 1
+    fi
+
+    audit_log "Mount successful: source=${SOURCE} mountpoint=${MOUNTPOINT} opts=${ACTUAL_OPTS}"
+else
+    log_error "Mount failed. Check source, filesystem type, and permissions."
+    audit_log "Mount FAILED: source=${SOURCE} mountpoint=${MOUNTPOINT}"
+    exit 1
+fi
