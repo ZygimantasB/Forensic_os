@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# =============================================================================
+# forensic-network - Network capture and analysis
+# =============================================================================
+# Capture mode: tcpdump wrapper with file rotation and BPF filters.
+# Analyze mode: tshark-based protocol analysis, conversations, DNS queries.
+# =============================================================================
+set -euo pipefail
+
+FORENSIC_TOOL_NAME="forensic-network"
+
+# ---- Source common library ---------------------------------------------------
+if [[ -f /opt/forensic-os/lib/forensic-common.sh ]]; then
+    source /opt/forensic-os/lib/forensic-common.sh
+elif [[ -f "$(dirname "$0")/../lib/forensic-common.sh" ]]; then
+    source "$(dirname "$0")/../lib/forensic-common.sh"
+else
+    echo "FATAL: forensic-common.sh not found." >&2
+    exit 1
+fi
+
+# ---- Usage -------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${BOLD}Usage:${NC} forensic-network <command> [OPTIONS]
+
+${BOLD}Commands:${NC}
+  capture    Capture network traffic
+  analyze    Analyze a PCAP file
+
+${BOLD}Capture Options:${NC}
+  -i INTERFACE   Network interface (required)
+  -o OUTPUT      Output PCAP file (required)
+  -f FILTER      BPF filter expression (e.g. "port 80")
+  -s SNAPLEN     Snap length in bytes (default: 0 = full packet)
+  -r SIZE_MB     Rotate file after SIZE_MB megabytes (default: 100)
+  -C COUNT       Max number of rotated files (default: 10)
+  -d DURATION    Capture duration in seconds (0 = until interrupted)
+
+${BOLD}Analyze Options:${NC}
+  -i INPUT       PCAP file to analyze (required)
+  -f FILTER      Display filter (Wireshark syntax)
+  -o OUTPUT      Write report to file
+  -m MODE        Analysis mode: summary (default), conversations,
+                 protocols, dns, http, endpoints, all
+
+${BOLD}Common Options:${NC}
+  -v             Verbose output
+  -h             Show this help
+
+${BOLD}Examples:${NC}
+  forensic-network capture -i eth0 -o traffic.pcap
+  forensic-network capture -i eth0 -o traffic.pcap -f "port 443" -d 3600
+  forensic-network analyze -i traffic.pcap -m summary
+  forensic-network analyze -i traffic.pcap -m dns -o dns_report.txt
+  forensic-network analyze -i traffic.pcap -m all -o full_report.txt
+EOF
+    exit "${1:-0}"
+}
+
+if [[ $# -lt 1 ]]; then
+    usage 1
+fi
+
+SUBCOMMAND="$1"
+shift
+
+case "$SUBCOMMAND" in
+    capture|analyze) ;;
+    -h|--help) usage 0 ;;
+    *) log_error "Unknown command: ${SUBCOMMAND}"; usage 1 ;;
+esac
+
+# =============================================================================
+# CAPTURE
+# =============================================================================
+if [[ "$SUBCOMMAND" == "capture" ]]; then
+    INTERFACE=""
+    OUTPUT=""
+    BPF_FILTER=""
+    SNAPLEN="0"
+    ROTATE_MB="100"
+    ROTATE_COUNT="10"
+    DURATION="0"
+
+    while getopts ":i:o:f:s:r:C:d:vh" opt; do
+        case "$opt" in
+            i) INTERFACE="$OPTARG" ;;
+            o) OUTPUT="$OPTARG" ;;
+            f) BPF_FILTER="$OPTARG" ;;
+            s) SNAPLEN="$OPTARG" ;;
+            r) ROTATE_MB="$OPTARG" ;;
+            C) ROTATE_COUNT="$OPTARG" ;;
+            d) DURATION="$OPTARG" ;;
+            v) FORENSIC_VERBOSE=1 ;;
+            h) usage 0 ;;
+            :) log_error "Option -${OPTARG} requires an argument."; usage 1 ;;
+            *) log_error "Unknown option: -${OPTARG}"; usage 1 ;;
+        esac
+    done
+
+    if [[ -z "$INTERFACE" ]]; then
+        log_error "Interface (-i) is required."
+        usage 1
+    fi
+    if [[ -z "$OUTPUT" ]]; then
+        log_error "Output (-o) is required."
+        usage 1
+    fi
+
+    require_root
+
+    if ! check_tool tcpdump tcpdump; then
+        exit 1
+    fi
+
+    # Verify interface exists
+    if ! ip link show "$INTERFACE" &>/dev/null; then
+        log_error "Network interface not found: ${INTERFACE}"
+        log_info "Available interfaces:"
+        ip -o link show | awk -F': ' '{print "  " $2}'
+        exit 1
+    fi
+
+    OUTPUT_DIR="$(dirname "$OUTPUT")"
+    mkdir -p "$OUTPUT_DIR" 2>/dev/null || true
+
+    audit_log "Network capture starting: interface=${INTERFACE} output=${OUTPUT} filter='${BPF_FILTER}'"
+
+    log_info "Network Capture Session"
+    log_info "  Interface  : ${INTERFACE}"
+    log_info "  Output     : ${OUTPUT}"
+    log_info "  Snap len   : ${SNAPLEN}"
+    log_info "  Rotation   : ${ROTATE_MB}MB x ${ROTATE_COUNT} files"
+    [[ -n "$BPF_FILTER" ]] && log_info "  BPF Filter : ${BPF_FILTER}"
+    [[ "$DURATION" -gt 0 ]] && log_info "  Duration   : ${DURATION}s"
+
+    # Build tcpdump command
+    TCPDUMP_CMD=(tcpdump
+        -i "$INTERFACE"
+        -w "$OUTPUT"
+        -s "$SNAPLEN"
+        -C "$ROTATE_MB"
+        -W "$ROTATE_COUNT"
+        -Z root
+        --time-stamp-precision=nano
+    )
+
+    if [[ -n "$BPF_FILTER" ]]; then
+        TCPDUMP_CMD+=($BPF_FILTER)
+    fi
+
+    log_info "Executing: ${TCPDUMP_CMD[*]}"
+    log_info "Press Ctrl+C to stop capture."
+
+    # Handle duration-limited capture
+    if [[ "$DURATION" -gt 0 ]]; then
+        timeout "$DURATION" "${TCPDUMP_CMD[@]}" || true
+    else
+        "${TCPDUMP_CMD[@]}" || true
+    fi
+
+    log_success "Capture stopped."
+
+    # Hash the output
+    if [[ -f "$OUTPUT" ]]; then
+        PCAP_SIZE="$(stat -c%s "$OUTPUT" 2>/dev/null || echo 0)"
+        PCAP_HASH="$(generate_hash "$OUTPUT" sha256)"
+        log_info "  File   : ${OUTPUT}"
+        log_info "  Size   : $(format_size "$PCAP_SIZE")"
+        log_info "  SHA256 : ${PCAP_HASH}"
+        echo "${PCAP_HASH}  $(basename "$OUTPUT")" > "${OUTPUT}.sha256.txt"
+        audit_log "Capture complete: output=${OUTPUT} size=${PCAP_SIZE} sha256=${PCAP_HASH}"
+    fi
+fi
+
+# =============================================================================
+# ANALYZE
+# =============================================================================
+if [[ "$SUBCOMMAND" == "analyze" ]]; then
+    INPUT=""
+    DISPLAY_FILTER=""
+    OUTPUT=""
+    MODE="summary"
+
+    while getopts ":i:f:o:m:vh" opt; do
+        case "$opt" in
+            i) INPUT="$OPTARG" ;;
+            f) DISPLAY_FILTER="$OPTARG" ;;
+            o) OUTPUT="$OPTARG" ;;
+            m) MODE="$OPTARG" ;;
+            v) FORENSIC_VERBOSE=1 ;;
+            h) usage 0 ;;
+            :) log_error "Option -${OPTARG} requires an argument."; usage 1 ;;
+            *) log_error "Unknown option: -${OPTARG}"; usage 1 ;;
+        esac
+    done
+
+    if [[ -z "$INPUT" ]]; then
+        log_error "Input (-i) is required."
+        usage 1
+    fi
+    if [[ ! -f "$INPUT" ]]; then
+        log_error "PCAP file not found: ${INPUT}"
+        exit 1
+    fi
+    if ! check_tool tshark tshark; then
+        log_error "tshark is required for analysis. Install: apt install tshark"
+        exit 1
+    fi
+
+    # Output to file or stdout
+    OUT_TARGET="/dev/stdout"
+    if [[ -n "$OUTPUT" ]]; then
+        OUT_TARGET="$OUTPUT"
+        : > "$OUTPUT"  # truncate
+    fi
+
+    audit_log "Network analysis starting: input=${INPUT} mode=${MODE}"
+
+    log_info "Network Analysis Session"
+    log_info "  Input  : ${INPUT}"
+    log_info "  Mode   : ${MODE}"
+    [[ -n "$DISPLAY_FILTER" ]] && log_info "  Filter : ${DISPLAY_FILTER}"
+
+    FILTER_ARGS=()
+    if [[ -n "$DISPLAY_FILTER" ]]; then
+        FILTER_ARGS=(-Y "$DISPLAY_FILTER")
+    fi
+
+    # ---- Analysis functions --------------------------------------------------
+    do_summary() {
+        echo "================================================================================"
+        echo "  PCAP Summary: ${INPUT}"
+        echo "================================================================================"
+        tshark -r "$INPUT" "${FILTER_ARGS[@]}" -q -z io,stat,0 2>/dev/null
+        echo ""
+        echo "--- Capture file info ---"
+        capinfos "$INPUT" 2>/dev/null || tshark -r "$INPUT" -q -z "expert,note" 2>/dev/null || true
+    }
+
+    do_protocols() {
+        echo "================================================================================"
+        echo "  Protocol Hierarchy"
+        echo "================================================================================"
+        tshark -r "$INPUT" "${FILTER_ARGS[@]}" -q -z io,phs 2>/dev/null
+    }
+
+    do_conversations() {
+        echo "================================================================================"
+        echo "  IP Conversations"
+        echo "================================================================================"
+        tshark -r "$INPUT" "${FILTER_ARGS[@]}" -q -z conv,ip 2>/dev/null
+        echo ""
+        echo "--- TCP Conversations ---"
+        tshark -r "$INPUT" "${FILTER_ARGS[@]}" -q -z conv,tcp 2>/dev/null
+    }
+
+    do_dns() {
+        echo "================================================================================"
+        echo "  DNS Queries"
+        echo "================================================================================"
+        tshark -r "$INPUT" -Y "dns.qry.name" -T fields \
+            -e frame.time -e ip.src -e ip.dst -e dns.qry.name -e dns.qry.type \
+            -e dns.a -e dns.aaaa 2>/dev/null | \
+            sort -u
+    }
+
+    do_http() {
+        echo "================================================================================"
+        echo "  HTTP Requests"
+        echo "================================================================================"
+        tshark -r "$INPUT" -Y "http.request" -T fields \
+            -e frame.time -e ip.src -e ip.dst -e http.request.method \
+            -e http.host -e http.request.uri -e http.user_agent 2>/dev/null
+        echo ""
+        echo "--- HTTP Response Codes ---"
+        tshark -r "$INPUT" -Y "http.response" -T fields \
+            -e ip.src -e http.response.code -e http.content_type 2>/dev/null | \
+            sort | uniq -c | sort -rn
+    }
+
+    do_endpoints() {
+        echo "================================================================================"
+        echo "  Top Endpoints"
+        echo "================================================================================"
+        tshark -r "$INPUT" "${FILTER_ARGS[@]}" -q -z endpoints,ip 2>/dev/null
+    }
+
+    # ---- Execute selected mode -----------------------------------------------
+    {
+        case "$MODE" in
+            summary)       do_summary ;;
+            conversations) do_conversations ;;
+            protocols)     do_protocols ;;
+            dns)           do_dns ;;
+            http)          do_http ;;
+            endpoints)     do_endpoints ;;
+            all)
+                do_summary
+                echo ""; do_protocols
+                echo ""; do_conversations
+                echo ""; do_endpoints
+                echo ""; do_dns
+                echo ""; do_http
+                ;;
+            *)
+                log_error "Unknown mode: ${MODE}"
+                exit 1
+                ;;
+        esac
+    } > "$OUT_TARGET" 2>&1
+
+    if [[ -n "$OUTPUT" ]]; then
+        log_success "Report written to: ${OUTPUT}"
+    fi
+
+    audit_log "Network analysis complete: input=${INPUT} mode=${MODE}"
+fi

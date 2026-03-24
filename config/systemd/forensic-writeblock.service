@@ -1,0 +1,64 @@
+[Unit]
+Description=ForensicOS Write-Block Service
+Documentation=https://github.com/forensic-os/forensic-os
+After=local-fs.target udev.service
+DefaultDependencies=no
+ConditionPathExists=/home/user/Forensic_os/config/udev/99-forensic-writeblock.rules
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Set all non-boot block devices to read-only at boot
+ExecStart=/bin/bash -c '\
+    BOOT_DEV=$(findmnt -n -o SOURCE / | sed "s/[0-9]*$//"); \
+    BOOT_DEV_NVME=$(findmnt -n -o SOURCE / | sed "s/p[0-9]*$//"); \
+    echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) WRITEBLOCK_SERVICE_START boot_device=${BOOT_DEV}" >> /var/log/forensic-audit.log; \
+    for dev in /sys/block/sd* /sys/block/nvme*; do \
+        [ -e "$dev" ] || continue; \
+        DEVNAME="/dev/$(basename $dev)"; \
+        if [ "$DEVNAME" != "$BOOT_DEV" ] && [ "$DEVNAME" != "$BOOT_DEV_NVME" ]; then \
+            /sbin/blockdev --setro "$DEVNAME" 2>/dev/null && \
+            echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) WRITE-BLOCK BOOT $DEVNAME set to read-only" >> /var/log/forensic-audit.log; \
+            logger -t forensic-writeblock "Boot write-block: $DEVNAME set to read-only"; \
+        fi; \
+    done; \
+    echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) WRITEBLOCK_SERVICE_READY all non-boot devices write-blocked" >> /var/log/forensic-audit.log'
+
+# On reload, re-apply write-blocks (useful after new device connections)
+ExecReload=/bin/bash -c '\
+    BOOT_DEV=$(findmnt -n -o SOURCE / | sed "s/[0-9]*$//"); \
+    BOOT_DEV_NVME=$(findmnt -n -o SOURCE / | sed "s/p[0-9]*$//"); \
+    for dev in /sys/block/sd* /sys/block/nvme*; do \
+        [ -e "$dev" ] || continue; \
+        DEVNAME="/dev/$(basename $dev)"; \
+        if [ "$DEVNAME" != "$BOOT_DEV" ] && [ "$DEVNAME" != "$BOOT_DEV_NVME" ]; then \
+            /sbin/blockdev --setro "$DEVNAME" 2>/dev/null; \
+        fi; \
+    done; \
+    echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) WRITEBLOCK_SERVICE_RELOAD write-blocks reapplied" >> /var/log/forensic-audit.log'
+
+# Monitor for new devices via udevadm and apply write-block
+ExecStartPost=/bin/bash -c '\
+    nohup /bin/bash -c '"'"' \
+        BOOT_DEV=$(findmnt -n -o SOURCE / | sed "s/[0-9]*$//"); \
+        udevadm monitor --kernel --subsystem-match=block 2>/dev/null | while read -r line; do \
+            if echo "$line" | grep -q "add.*block"; then \
+                sleep 1; \
+                for dev in /sys/block/sd* /sys/block/nvme*; do \
+                    [ -e "$dev" ] || continue; \
+                    DEVNAME="/dev/$(basename $dev)"; \
+                    if [ "$DEVNAME" != "$BOOT_DEV" ]; then \
+                        RO=$(cat "$dev/ro" 2>/dev/null || echo 1); \
+                        if [ "$RO" = "0" ]; then \
+                            /sbin/blockdev --setro "$DEVNAME" 2>/dev/null; \
+                            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) WRITE-BLOCK MONITOR $DEVNAME set to read-only" >> /var/log/forensic-audit.log; \
+                        fi; \
+                    fi; \
+                done; \
+            fi; \
+        done \
+    '"'"' &'
+
+[Install]
+WantedBy=multi-user.target

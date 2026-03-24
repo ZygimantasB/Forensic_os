@@ -1,0 +1,31 @@
+# Build outputs
+*.iso
+*.img
+*.hybrid.iso
+
+# live-build working directories
+config/live-build/.build/
+config/live-build/binary/
+config/live-build/cache/
+config/live-build/chroot/
+config/live-build/local/
+config/live-build/source/
+config/live-build/binary.contents
+config/live-build/build.log
+
+# Case data (never commit evidence)
+cases/
+evidence/
+
+# OS/editor files
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Temporary files
+/tmp/
+*.tmp
+*.bak

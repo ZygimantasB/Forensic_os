@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# =============================================================================
+# forensic-memory - Memory acquisition and analysis
+# =============================================================================
+# Acquire: captures live memory using AVML or LiME.
+# Analyze: wraps Volatility3 for memory image analysis (pslist, netscan, etc.).
+# =============================================================================
+set -euo pipefail
+
+FORENSIC_TOOL_NAME="forensic-memory"
+
+# ---- Source common library ---------------------------------------------------
+if [[ -f /opt/forensic-os/lib/forensic-common.sh ]]; then
+    source /opt/forensic-os/lib/forensic-common.sh
+elif [[ -f "$(dirname "$0")/../lib/forensic-common.sh" ]]; then
+    source "$(dirname "$0")/../lib/forensic-common.sh"
+else
+    echo "FATAL: forensic-common.sh not found." >&2
+    exit 1
+fi
+
+# ---- Usage -------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${BOLD}Usage:${NC} forensic-memory <command> [OPTIONS]
+
+${BOLD}Commands:${NC}
+  acquire    Capture live system memory
+  analyze    Analyze a memory image with Volatility3
+
+${BOLD}Acquire Options:${NC}
+  -o OUTPUT      Output file for memory dump (required)
+  -t TOOL        Acquisition tool: avml (default), lime
+  -c CASE_DIR    Case directory
+
+${BOLD}Analyze Options:${NC}
+  -i INPUT       Memory image to analyze (required)
+  -p PROFILE     Volatility profile/symbol table (auto-detect if omitted)
+  -c PLUGIN      Volatility3 plugin to run (default: pslist)
+                 Common: pslist, pstree, netscan, netstat, filescan,
+                         dlllist, handles, cmdline, malfind, hashdump
+  -o OUTPUT      Write analysis output to file
+  -A             Run all common plugins
+
+${BOLD}Common Options:${NC}
+  -v             Verbose output
+  -h             Show this help
+
+${BOLD}Examples:${NC}
+  forensic-memory acquire -o memory.raw
+  forensic-memory acquire -o memory.lime -t lime
+  forensic-memory analyze -i memory.raw -c pslist
+  forensic-memory analyze -i memory.raw -c netscan -o netscan.txt
+  forensic-memory analyze -i memory.raw -A -o full_report.txt
+EOF
+    exit "${1:-0}"
+}
+
+# Bail if no subcommand
+if [[ $# -lt 1 ]]; then
+    usage 1
+fi
+
+SUBCOMMAND="$1"
+shift
+
+case "$SUBCOMMAND" in
+    acquire|analyze) ;;
+    -h|--help) usage 0 ;;
+    *) log_error "Unknown command: ${SUBCOMMAND}"; usage 1 ;;
+esac
+
+# ---- Common plugins list -----------------------------------------------------
+COMMON_PLUGINS=(
+    "linux.pslist.PsList"
+    "linux.pstree.PsTree"
+    "linux.netscan.Netscan"
+    "linux.filescan.Filescan"
+    "linux.bash.Bash"
+    "linux.check_syscall.Check_syscall"
+    "linux.lsmod.Lsmod"
+    "linux.proc.Maps"
+    "linux.tty_check.tty_check"
+)
+
+WINDOWS_PLUGINS=(
+    "windows.pslist.PsList"
+    "windows.pstree.PsTree"
+    "windows.netscan.NetScan"
+    "windows.filescan.FileScan"
+    "windows.dlllist.DllList"
+    "windows.handles.Handles"
+    "windows.cmdline.CmdLine"
+    "windows.malfind.Malfind"
+    "windows.hashdump.Hashdump"
+    "windows.registry.hivelist.HiveList"
+)
+
+# =============================================================================
+# ACQUIRE
+# =============================================================================
+if [[ "$SUBCOMMAND" == "acquire" ]]; then
+    OUTPUT=""
+    ACQ_TOOL="avml"
+
+    while getopts ":o:t:c:vh" opt; do
+        case "$opt" in
+            o) OUTPUT="$OPTARG" ;;
+            t) ACQ_TOOL="$OPTARG" ;;
+            c) FORENSIC_CASE_DIR="$OPTARG" ;;
+            v) FORENSIC_VERBOSE=1 ;;
+            h) usage 0 ;;
+            :) log_error "Option -${OPTARG} requires an argument."; usage 1 ;;
+            *) log_error "Unknown option: -${OPTARG}"; usage 1 ;;
+        esac
+    done
+
+    if [[ -z "$OUTPUT" ]]; then
+        log_error "Output (-o) is required for acquisition."
+        usage 1
+    fi
+
+    require_root
+
+    OUTPUT_DIR="$(dirname "$OUTPUT")"
+    mkdir -p "$OUTPUT_DIR" 2>/dev/null || true
+
+    audit_log "Memory acquisition starting: output=${OUTPUT} tool=${ACQ_TOOL}"
+
+    log_info "Memory Acquisition"
+    log_info "  Output : ${OUTPUT}"
+    log_info "  Tool   : ${ACQ_TOOL}"
+
+    START_TIME="$(date +%s)"
+
+    case "$ACQ_TOOL" in
+        avml)
+            if ! check_tool avml avml; then
+                log_error "AVML is not installed. Install from https://github.com/microsoft/avml"
+                exit 1
+            fi
+            log_info "Acquiring memory with AVML..."
+            avml "$OUTPUT"
+            ;;
+
+        lime)
+            # LiME is a kernel module
+            LIME_MOD="$(find /lib/modules/$(uname -r) -name 'lime.ko*' 2>/dev/null | head -1)"
+            if [[ -z "$LIME_MOD" ]]; then
+                log_error "LiME kernel module not found for kernel $(uname -r)."
+                log_error "Build it: cd LiME/src && make"
+                exit 1
+            fi
+            log_info "Loading LiME module: ${LIME_MOD}"
+            insmod "$LIME_MOD" "path=${OUTPUT} format=lime" || {
+                log_error "Failed to load LiME module."
+                exit 1
+            }
+            # Wait for dump to complete
+            log_info "Memory acquisition in progress..."
+            while lsmod | grep -q lime; do
+                sleep 1
+            done
+            ;;
+
+        *)
+            log_error "Unsupported acquisition tool: ${ACQ_TOOL}. Use: avml, lime."
+            exit 1
+            ;;
+    esac
+
+    END_TIME="$(date +%s)"
+    ELAPSED=$(( END_TIME - START_TIME ))
+
+    if [[ -f "$OUTPUT" ]]; then
+        DUMP_SIZE="$(stat -c%s "$OUTPUT")"
+        DUMP_HASH="$(generate_hash "$OUTPUT" sha256)"
+        log_success "Memory acquired successfully."
+        log_info "  File   : ${OUTPUT}"
+        log_info "  Size   : $(format_size "$DUMP_SIZE")"
+        log_info "  SHA256 : ${DUMP_HASH}"
+        log_info "  Time   : ${ELAPSED}s"
+        echo "${DUMP_HASH}  $(basename "$OUTPUT")" > "${OUTPUT}.sha256.txt"
+        audit_log "Memory acquired: output=${OUTPUT} size=${DUMP_SIZE} sha256=${DUMP_HASH} elapsed=${ELAPSED}s"
+    else
+        log_error "Memory dump file was not created."
+        audit_log "Memory acquisition FAILED: output=${OUTPUT}"
+        exit 1
+    fi
+fi
+
+# =============================================================================
+# ANALYZE
+# =============================================================================
+if [[ "$SUBCOMMAND" == "analyze" ]]; then
+    INPUT=""
+    PROFILE=""
+    PLUGIN="windows.pslist.PsList"
+    OUTPUT=""
+    RUN_ALL=0
+
+    while getopts ":i:p:c:o:Avh" opt; do
+        case "$opt" in
+            i) INPUT="$OPTARG" ;;
+            p) PROFILE="$OPTARG" ;;
+            c) PLUGIN="$OPTARG" ;;
+            o) OUTPUT="$OPTARG" ;;
+            A) RUN_ALL=1 ;;
+            v) FORENSIC_VERBOSE=1 ;;
+            h) usage 0 ;;
+            :) log_error "Option -${OPTARG} requires an argument."; usage 1 ;;
+            *) log_error "Unknown option: -${OPTARG}"; usage 1 ;;
+        esac
+    done
+
+    if [[ -z "$INPUT" ]]; then
+        log_error "Input (-i) is required for analysis."
+        usage 1
+    fi
+    if [[ ! -f "$INPUT" ]]; then
+        log_error "Memory image not found: ${INPUT}"
+        exit 1
+    fi
+
+    # Detect volatility3
+    VOL_CMD=""
+    if command -v vol &>/dev/null; then
+        VOL_CMD="vol"
+    elif command -v vol3 &>/dev/null; then
+        VOL_CMD="vol3"
+    elif command -v volatility3 &>/dev/null; then
+        VOL_CMD="volatility3"
+    elif python3 -c "import volatility3" &>/dev/null 2>&1; then
+        VOL_CMD="python3 -m volatility3"
+    else
+        log_error "Volatility3 not found. Install: pip3 install volatility3"
+        exit 1
+    fi
+
+    log_info "Memory Analysis Session"
+    log_info "  Image      : ${INPUT}"
+    log_info "  Volatility : ${VOL_CMD}"
+    [[ -n "$PROFILE" ]] && log_info "  Profile    : ${PROFILE}"
+
+    audit_log "Memory analysis starting: image=${INPUT} plugin=${PLUGIN} run_all=${RUN_ALL}"
+
+    # Helper: run a single plugin
+    run_plugin() {
+        local plugin_name="$1"
+        local out_target="${2:-}"
+
+        log_info "Running plugin: ${plugin_name}"
+
+        local vol_args=(-f "$INPUT")
+        if [[ -n "$PROFILE" ]]; then
+            vol_args+=(--single-location "file://${INPUT}")
+        fi
+        vol_args+=("$plugin_name")
+
+        if [[ -n "$out_target" ]]; then
+            {
+                echo ""
+                echo "================================================================"
+                echo "  Plugin: ${plugin_name}"
+                echo "  Timestamp: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+                echo "================================================================"
+                $VOL_CMD "${vol_args[@]}" 2>&1
+            } >> "$out_target"
+        else
+            echo ""
+            echo "================================================================"
+            echo "  Plugin: ${plugin_name}"
+            echo "================================================================"
+            $VOL_CMD "${vol_args[@]}" 2>&1
+        fi
+    }
+
+    START_TIME="$(date +%s)"
+
+    if [[ "$RUN_ALL" -eq 1 ]]; then
+        log_info "Running all common plugins..."
+
+        # Try Windows plugins first, then Linux
+        ALL_PLUGINS=("${WINDOWS_PLUGINS[@]}" "${LINUX_PLUGINS[@]:-}")
+
+        for p in "${WINDOWS_PLUGINS[@]}"; do
+            run_plugin "$p" "$OUTPUT" || log_warn "Plugin ${p} failed (may not apply to this image)."
+        done
+        for p in "${COMMON_PLUGINS[@]}"; do
+            run_plugin "$p" "$OUTPUT" || log_warn "Plugin ${p} failed (may not apply to this image)."
+        done
+    else
+        # Expand shorthand plugin names
+        case "$PLUGIN" in
+            pslist)    PLUGIN="windows.pslist.PsList" ;;
+            pstree)    PLUGIN="windows.pstree.PsTree" ;;
+            netscan)   PLUGIN="windows.netscan.NetScan" ;;
+            netstat)   PLUGIN="windows.netstat.NetStat" ;;
+            filescan)  PLUGIN="windows.filescan.FileScan" ;;
+            dlllist)   PLUGIN="windows.dlllist.DllList" ;;
+            handles)   PLUGIN="windows.handles.Handles" ;;
+            cmdline)   PLUGIN="windows.cmdline.CmdLine" ;;
+            malfind)   PLUGIN="windows.malfind.Malfind" ;;
+            hashdump)  PLUGIN="windows.hashdump.Hashdump" ;;
+        esac
+
+        run_plugin "$PLUGIN" "$OUTPUT"
+    fi
+
+    END_TIME="$(date +%s)"
+    ELAPSED=$(( END_TIME - START_TIME ))
+
+    if [[ -n "$OUTPUT" && -f "$OUTPUT" ]]; then
+        log_success "Analysis output written to: ${OUTPUT}"
+    fi
+    log_info "Analysis completed in ${ELAPSED}s."
+
+    audit_log "Memory analysis complete: image=${INPUT} elapsed=${ELAPSED}s"
+fi

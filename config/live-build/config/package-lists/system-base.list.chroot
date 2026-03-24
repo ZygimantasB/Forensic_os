@@ -1,0 +1,41 @@
+# Forensic OS - Base System Package List
+# Desktop environment
+xfce4
+lightdm
+
+# Web browser
+firefox
+
+# Terminal and editors
+xterm
+nano
+vim
+mousepad
+
+# Development and scripting
+git
+python3
+python3-pip
+jq
+
+# Networking
+curl
+wget
+openssh-client
+net-tools
+
+# System utilities
+htop
+tmux
+file-roller
+gnome-disk-utility
+
+# GUI dialog tools
+yad
+zenity
+
+# Reporting
+wkhtmltopdf
+
+# Image viewer
+ristretto

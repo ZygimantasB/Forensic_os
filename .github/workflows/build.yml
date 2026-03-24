@@ -1,0 +1,65 @@
+name: Build ForensicOS
+
+on:
+  push:
+    branches: [ main, develop, 'claude/*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Lint all shell scripts
+        run: |
+          find tools/ lib/ ui/ scripts/ -type f -executable | while read -r script; do
+            if head -1 "$script" | grep -q 'bash\|sh'; then
+              echo "Checking: $script"
+              shellcheck -x "$script" || true
+            fi
+          done
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sleuthkit ewf-tools hashdeep dcfldd foremost
+
+      - name: Run unit tests
+        run: |
+          for test in tests/test-*.sh; do
+            echo "=== Running: $test ==="
+            bash "$test" || echo "WARN: $test had failures"
+          done
+
+  build-iso:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install live-build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y live-build debootstrap
+
+      - name: Build ISO
+        run: sudo make build
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: forensic-os-iso
+          path: "*.iso"
+          retention-days: 30

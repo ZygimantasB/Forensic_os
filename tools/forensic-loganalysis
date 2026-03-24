@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+# =============================================================================
+# forensic-loganalysis - Log analysis and correlation
+# =============================================================================
+# Parses common log formats (syslog, Windows Event, Apache, auth), performs
+# keyword searches, and generates timeline correlations.
+# =============================================================================
+set -euo pipefail
+
+FORENSIC_TOOL_NAME="forensic-loganalysis"
+
+# ---- Source common library ---------------------------------------------------
+if [[ -f /opt/forensic-os/lib/forensic-common.sh ]]; then
+    source /opt/forensic-os/lib/forensic-common.sh
+elif [[ -f "$(dirname "$0")/../lib/forensic-common.sh" ]]; then
+    source "$(dirname "$0")/../lib/forensic-common.sh"
+else
+    echo "FATAL: forensic-common.sh not found." >&2
+    exit 1
+fi
+
+# ---- Usage -------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${BOLD}Usage:${NC} forensic-loganalysis -s source_dir [OPTIONS]
+
+${BOLD}Options:${NC}
+  -s SOURCE      Source directory or file containing logs (required)
+  -t TYPE        Log type: auto (default), linux, windows, apache, auth
+  -k KEYWORD     Search for keyword/pattern across all logs
+  -o OUTPUT      Output file (default: stdout)
+  -f FORMAT      Output format: text (default), csv, json
+  -S START_DATE  Filter: start date (YYYY-MM-DD)
+  -E END_DATE    Filter: end date (YYYY-MM-DD)
+  -c CASE_DIR    Case directory (overrides FORENSIC_CASE_DIR)
+  -T             Generate timeline correlation across all logs
+  -v             Verbose output
+  -h             Show this help
+
+${BOLD}Examples:${NC}
+  forensic-loganalysis -s /var/log -t linux -k "Failed password"
+  forensic-loganalysis -s /evidence/logs -t auto -o report.txt
+  forensic-loganalysis -s /evidence/logs -T -o timeline.csv -f csv
+  forensic-loganalysis -s /evidence/logs -k "192.168.1.100" -f json
+EOF
+    exit "${1:-0}"
+}
+
+# ---- Argument Parsing --------------------------------------------------------
+SOURCE=""
+LOG_TYPE="auto"
+KEYWORD=""
+OUTPUT=""
+FORMAT="text"
+START_DATE=""
+END_DATE=""
+TIMELINE_MODE=0
+
+while getopts ":s:t:k:o:f:S:E:c:Tvh" opt; do
+    case "$opt" in
+        s) SOURCE="$OPTARG" ;;
+        t) LOG_TYPE="$OPTARG" ;;
+        k) KEYWORD="$OPTARG" ;;
+        o) OUTPUT="$OPTARG" ;;
+        f) FORMAT="$OPTARG" ;;
+        S) START_DATE="$OPTARG" ;;
+        E) END_DATE="$OPTARG" ;;
+        c) FORENSIC_CASE_DIR="$OPTARG" ;;
+        T) TIMELINE_MODE=1 ;;
+        v) FORENSIC_VERBOSE=1 ;;
+        h) usage 0 ;;
+        :) log_error "Option -${OPTARG} requires an argument."; usage 1 ;;
+        *) log_error "Unknown option: -${OPTARG}"; usage 1 ;;
+    esac
+done
+
+# ---- Validation --------------------------------------------------------------
+if [[ -z "$SOURCE" ]]; then
+    log_error "Source (-s) is required."
+    usage 1
+fi
+if [[ ! -e "$SOURCE" ]]; then
+    log_error "Source does not exist: ${SOURCE}"
+    exit 1
+fi
+
+audit_log "Log analysis starting: source=${SOURCE} type=${LOG_TYPE} keyword='${KEYWORD}'"
+
+log_info "Log Analysis Session"
+log_info "  Source  : ${SOURCE}"
+log_info "  Type    : ${LOG_TYPE}"
+log_info "  Format  : ${FORMAT}"
+[[ -n "$KEYWORD" ]]    && log_info "  Keyword : ${KEYWORD}"
+[[ -n "$START_DATE" ]] && log_info "  Start   : ${START_DATE}"
+[[ -n "$END_DATE" ]]   && log_info "  End     : ${END_DATE}"
+
+# ---- Helper: collect log files -----------------------------------------------
+declare -a LOG_FILES=()
+
+collect_logs() {
+    if [[ -f "$SOURCE" ]]; then
+        LOG_FILES+=("$SOURCE")
+        return
+    fi
+
+    case "$LOG_TYPE" in
+        linux)
+            while IFS= read -r -d '' f; do LOG_FILES+=("$f"); done < \
+                <(find "$SOURCE" -type f \( \
+                    -name "syslog*" -o -name "kern.log*" -o -name "daemon.log*" \
+                    -o -name "messages*" -o -name "dmesg*" -o -name "boot.log*" \
+                    -o -name "cron*" \) -print0 2>/dev/null)
+            ;;
+        auth)
+            while IFS= read -r -d '' f; do LOG_FILES+=("$f"); done < \
+                <(find "$SOURCE" -type f \( \
+                    -name "auth.log*" -o -name "secure*" -o -name "faillog*" \
+                    -o -name "lastlog*" -o -name "wtmp*" -o -name "btmp*" \) -print0 2>/dev/null)
+            ;;
+        apache)
+            while IFS= read -r -d '' f; do LOG_FILES+=("$f"); done < \
+                <(find "$SOURCE" -type f \( \
+                    -name "access.log*" -o -name "error.log*" \
+                    -o -name "access_log*" -o -name "error_log*" \
+                    -o -name "*apache*" -o -name "*httpd*" -o -name "*nginx*" \) -print0 2>/dev/null)
+            ;;
+        windows)
+            while IFS= read -r -d '' f; do LOG_FILES+=("$f"); done < \
+                <(find "$SOURCE" -type f \( \
+                    -name "*.evtx" -o -name "*.evt" -o -name "*.log" \) -print0 2>/dev/null)
+            ;;
+        auto|*)
+            while IFS= read -r -d '' f; do LOG_FILES+=("$f"); done < \
+                <(find "$SOURCE" -type f \( \
+                    -name "*.log" -o -name "*.log.*" -o -name "syslog*" \
+                    -o -name "auth.log*" -o -name "secure*" -o -name "messages*" \
+                    -o -name "access.log*" -o -name "error.log*" \
+                    -o -name "*.evtx" -o -name "*.evt" \
+                    -o -name "kern.log*" -o -name "daemon.log*" \
+                    -o -name "cron*" -o -name "mail.log*" \) -print0 2>/dev/null)
+            ;;
+    esac
+}
+
+collect_logs
+
+if [[ ${#LOG_FILES[@]} -eq 0 ]]; then
+    log_error "No log files found matching type '${LOG_TYPE}' in ${SOURCE}"
+    exit 1
+fi
+
+log_info "Found ${#LOG_FILES[@]} log file(s) to analyze."
+
+# ---- Helper: read a log file (handles compressed and evtx) -------------------
+read_log() {
+    local file="$1"
+    if [[ "$file" == *.gz ]]; then
+        zcat "$file" 2>/dev/null
+    elif [[ "$file" == *.bz2 ]]; then
+        bzcat "$file" 2>/dev/null
+    elif [[ "$file" == *.xz ]]; then
+        xzcat "$file" 2>/dev/null
+    elif [[ "$file" == *.evtx ]]; then
+        if command -v evtx_dump &>/dev/null; then
+            evtx_dump "$file" 2>/dev/null
+        elif command -v python3 &>/dev/null && python3 -c "import Evtx" &>/dev/null 2>&1; then
+            python3 -c "
+import Evtx.Evtx as evtx
+import sys
+with evtx.Evtx('$file') as log:
+    for record in log.records():
+        print(record.xml())
+" 2>/dev/null
+        else
+            log_warn "Cannot parse EVTX: ${file} (install evtx_dump or python-evtx)"
+            return 1
+        fi
+    else
+        cat "$file" 2>/dev/null
+    fi
+}
+
+# ---- Helper: detect log format heuristically ---------------------------------
+detect_type() {
+    local file="$1"
+    local sample
+    sample="$(read_log "$file" 2>/dev/null | head -5)"
+
+    if echo "$sample" | grep -qE '^[A-Z][a-z]{2} [ 0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}'; then
+        echo "syslog"
+    elif echo "$sample" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'; then
+        echo "iso8601"
+    elif echo "$sample" | grep -qP '^\d+\.\d+\.\d+\.\d+ - - \[' 2>/dev/null; then
+        echo "apache_combined"
+    elif echo "$sample" | grep -qE '<Event xmlns'; then
+        echo "windows_evtx"
+    else
+        echo "unknown"
+    fi
+}
+
+# ---- Output setup ------------------------------------------------------------
+TMPOUT="$(mktemp)"
+trap 'rm -f "$TMPOUT"' EXIT
+
+# =============================================================================
+# Keyword search mode
+# =============================================================================
+if [[ -n "$KEYWORD" ]]; then
+    log_info "Searching for keyword: '${KEYWORD}'"
+
+    MATCH_COUNT=0
+    FIRST_JSON=1
+    {
+        if [[ "$FORMAT" == "json" ]]; then
+            echo "["
+        elif [[ "$FORMAT" == "csv" ]]; then
+            echo "file,line_number,content"
+        else
+            echo "================================================================================"
+            echo "  Keyword Search: '${KEYWORD}'"
+            echo "  Source: ${SOURCE}"
+            echo "  Timestamp: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+            echo "================================================================================"
+        fi
+
+        for logfile in "${LOG_FILES[@]}"; do
+            LINE_NUM=0
+            while IFS= read -r line; do
+                (( LINE_NUM++ ))
+                if echo "$line" | grep -qi "$KEYWORD"; then
+                    (( MATCH_COUNT++ ))
+                    case "$FORMAT" in
+                        csv)
+                            escaped="${line//\"/\"\"}"
+                            printf '%s,%d,"%s"\n' "$logfile" "$LINE_NUM" "$escaped"
+                            ;;
+                        json)
+                            escaped="${line//\\/\\\\}"
+                            escaped="${escaped//\"/\\\"}"
+                            if [[ "$FIRST_JSON" -eq 1 ]]; then
+                                FIRST_JSON=0
+                            else
+                                echo ","
+                            fi
+                            printf '  {"file":"%s","line":%d,"content":"%s"}' \
+                                "$logfile" "$LINE_NUM" "$escaped"
+                            ;;
+                        *)
+                            printf '%s:%d: %s\n' "$(basename "$logfile")" "$LINE_NUM" "$line"
+                            ;;
+                    esac
+                fi
+            done < <(read_log "$logfile" 2>/dev/null)
+        done
+
+        if [[ "$FORMAT" == "json" ]]; then
+            echo ""
+            echo "]"
+        fi
+    } > "$TMPOUT"
+
+    log_info "Found ${MATCH_COUNT} matching line(s)."
+fi
+
+# =============================================================================
+# Timeline correlation mode
+# =============================================================================
+if [[ "$TIMELINE_MODE" -eq 1 ]]; then
+    log_info "Generating timeline correlation..."
+
+    TIMELINE_TMP="$(mktemp)"
+
+    for logfile in "${LOG_FILES[@]}"; do
+        local_type="$(detect_type "$logfile")"
+        [[ "$FORENSIC_VERBOSE" -eq 1 ]] && log_info "  Parsing ${logfile} (${local_type})"
+
+        while IFS= read -r line; do
+            ts=""
+            case "$local_type" in
+                syslog)
+                    ts="$(echo "$line" | grep -oP '^[A-Z][a-z]{2} [ 0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' || true)"
+                    if [[ -n "$ts" ]]; then
+                        ts="$(date -d "$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts")"
+                    fi
+                    ;;
+                iso8601)
+                    ts="$(echo "$line" | grep -oP '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}' || true)"
+                    ts="${ts/T/ }"
+                    ;;
+                apache_combined)
+                    ts="$(echo "$line" | grep -oP '\[\K[^\]]+' | head -1 || true)"
+                    if [[ -n "$ts" ]]; then
+                        ts="$(date -d "$(echo "$ts" | sed 's|/| |g; s|:| |')" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts")"
+                    fi
+                    ;;
+                *)
+                    ts="$(echo "$line" | grep -oP '\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}' | head -1 || true)"
+                    ts="${ts/T/ }"
+                    ;;
+            esac
+
+            if [[ -n "$ts" ]]; then
+                # Apply date filters
+                if [[ -n "$START_DATE" ]]; then
+                    ts_date="${ts%% *}"
+                    [[ "$ts_date" < "$START_DATE" ]] && continue
+                fi
+                if [[ -n "$END_DATE" ]]; then
+                    ts_date="${ts%% *}"
+                    [[ "$ts_date" > "$END_DATE" ]] && continue
+                fi
+
+                printf '%s|%s|%s\n' "$ts" "$(basename "$logfile")" "$line" >> "$TIMELINE_TMP"
+            fi
+        done < <(read_log "$logfile" 2>/dev/null)
+    done
+
+    # Sort timeline by timestamp
+    SORTED_TMP="$(mktemp)"
+    sort -t'|' -k1,1 "$TIMELINE_TMP" > "$SORTED_TMP"
+
+    TOTAL_EVENTS="$(wc -l < "$SORTED_TMP")"
+    log_info "Correlated ${TOTAL_EVENTS} events."
+
+    {
+        if [[ "$FORMAT" == "csv" ]]; then
+            echo "timestamp,source,event"
+            while IFS='|' read -r ts src content; do
+                escaped="${content//\"/\"\"}"
+                printf '%s,%s,"%s"\n' "$ts" "$src" "$escaped"
+            done < "$SORTED_TMP"
+        elif [[ "$FORMAT" == "json" ]]; then
+            echo "["
+            first=1
+            while IFS='|' read -r ts src content; do
+                escaped="${content//\\/\\\\}"
+                escaped="${escaped//\"/\\\"}"
+                if [[ "$first" -eq 1 ]]; then first=0; else echo ","; fi
+                printf '  {"timestamp":"%s","source":"%s","event":"%s"}' "$ts" "$src" "$escaped"
+            done < "$SORTED_TMP"
+            echo ""
+            echo "]"
+        else
+            echo "================================================================================"
+            echo "  Timeline Correlation"
+            echo "  Source: ${SOURCE}"
+            echo "  Events: ${TOTAL_EVENTS}"
+            echo "  Generated: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+            echo "================================================================================"
+            while IFS='|' read -r ts src content; do
+                printf '[%s] %-20s %s\n' "$ts" "$src" "$content"
+            done < "$SORTED_TMP"
+        fi
+    } > "$TMPOUT"
+
+    rm -f "$TIMELINE_TMP" "$SORTED_TMP"
+fi
+
+# =============================================================================
+# Default mode: summary analysis
+# =============================================================================
+if [[ -z "$KEYWORD" && "$TIMELINE_MODE" -eq 0 ]]; then
+    log_info "Running summary analysis..."
+
+    {
+        echo "================================================================================"
+        echo "  Log Analysis Summary"
+        echo "  Source: ${SOURCE}"
+        echo "  Type: ${LOG_TYPE}"
+        echo "  Generated: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo "================================================================================"
+        echo ""
+
+        for logfile in "${LOG_FILES[@]}"; do
+            local_type="$(detect_type "$logfile")"
+            line_count="$(read_log "$logfile" 2>/dev/null | wc -l)"
+            fsize="$(stat -c%s "$logfile" 2>/dev/null || echo 0)"
+
+            echo "--- $(basename "$logfile") ---"
+            echo "  Path   : ${logfile}"
+            echo "  Type   : ${local_type}"
+            echo "  Lines  : ${line_count}"
+            echo "  Size   : $(format_size "$fsize")"
+
+            # Quick stats per detected format
+            case "$local_type" in
+                syslog)
+                    echo "  Top processes:"
+                    read_log "$logfile" 2>/dev/null | \
+                        grep -oP '^\S+ \S+ \S+ \S+ \K\S+' | \
+                        sed 's/\[.*//; s/://' | sort | uniq -c | sort -rn | head -5 | \
+                        while read -r cnt proc; do
+                            echo "    ${cnt}  ${proc}"
+                        done
+                    ;;
+                apache_combined)
+                    echo "  Top IPs:"
+                    read_log "$logfile" 2>/dev/null | \
+                        awk '{print $1}' | sort | uniq -c | sort -rn | head -5 | \
+                        while read -r cnt ip; do
+                            echo "    ${cnt}  ${ip}"
+                        done
+                    echo "  HTTP status codes:"
+                    read_log "$logfile" 2>/dev/null | \
+                        awk '{print $9}' | sort | uniq -c | sort -rn | head -5 | \
+                        while read -r cnt code; do
+                            echo "    ${cnt}  ${code}"
+                        done
+                    echo "  Suspicious patterns (SQLi, XSS, traversal):"
+                    local suspicious
+                    suspicious="$(read_log "$logfile" 2>/dev/null | \
+                        grep -ciE "union.*select|<script|\.\.\/|\/etc\/passwd|cmd\.exe|eval\(" || echo 0)"
+                    echo "    ${suspicious} suspicious requests found"
+                    ;;
+            esac
+
+            # Error / warning / failure counts
+            local errs warns fails
+            errs="$(read_log "$logfile" 2>/dev/null | grep -ci 'error' || echo 0)"
+            warns="$(read_log "$logfile" 2>/dev/null | grep -ci 'warn' || echo 0)"
+            fails="$(read_log "$logfile" 2>/dev/null | grep -ci 'fail' || echo 0)"
+            echo "  Errors : ${errs}  Warnings : ${warns}  Failures : ${fails}"
+            echo ""
+        done
+
+        echo "================================================================================"
+        echo "  Total log files analyzed: ${#LOG_FILES[@]}"
+        echo "================================================================================"
+    } > "$TMPOUT"
+fi
+
+# ---- Output results ----------------------------------------------------------
+if [[ -n "$OUTPUT" ]]; then
+    cp "$TMPOUT" "$OUTPUT"
+    log_success "Report written to: ${OUTPUT}"
+else
+    cat "$TMPOUT"
+fi
+
+audit_log "Log analysis complete: source=${SOURCE} type=${LOG_TYPE} files=${#LOG_FILES[@]}"
+log_success "Log analysis complete."

@@ -1,0 +1,62 @@
+# Forensic OS - Forensic Tools Package List
+# Disk / filesystem forensics
+sleuthkit
+autopsy
+foremost
+scalpel
+dcfldd
+testdisk
+gparted
+
+# Disk image handling
+ewf-tools
+libewf-dev
+afflib-tools
+xmount
+guymager
+
+# Hashing and verification
+hashdeep
+
+# Binary / firmware analysis
+binwalk
+xxd
+hexedit
+
+# Network forensics
+wireshark-common
+tshark
+tcpdump
+
+# Malware analysis
+yara
+clamav
+
+# Metadata extraction
+libimage-exiftool-perl
+
+# Bulk data extraction
+bulk-extractor
+
+# Volume and encryption
+cryptsetup
+lvm2
+dmraid
+ntfs-3g
+dislocker
+libbde-utils
+libvshadow-utils
+
+# Browser / Windows artifact tools
+pasco
+galleta
+rifiuti2
+vinetto
+pff-tools
+
+# Archive tools
+p7zip-full
+
+# Timeline / advanced forensics (from GIFT PPA if available)
+# volatility3 - installed via pip in hook if unavailable as deb
+# plaso - installed from GIFT PPA

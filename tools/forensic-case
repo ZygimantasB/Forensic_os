@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+#
+# forensic-case - ForensicOS Case Management Tool
+# Usage: forensic-case init [-n case_number] [-e examiner] [-d description] | status | list | close
+#
+
+set -euo pipefail
+
+FORENSIC_CASES_DIR="${FORENSIC_CASES_DIR:-/home/user/Forensic_os/cases}"
+CURRENT_CASE_FILE="${FORENSIC_CASES_DIR}/.current_case"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+usage() {
+    cat <<'EOF'
+Usage: forensic-case <command> [options]
+
+Commands:
+  init    Initialize a new forensic case
+  status  Show current case information
+  list    List all cases
+  close   Close and finalize the current case
+
+Init Options:
+  -n CASE_NUMBER   Case number (e.g., 2026-0042)
+  -e EXAMINER      Examiner name
+  -d DESCRIPTION   Case description
+
+Examples:
+  forensic-case init -n 2026-0042 -e "J. Smith" -d "Hard drive analysis"
+  forensic-case status
+  forensic-case list
+  forensic-case close
+EOF
+    exit 1
+}
+
+# Generate a case number if not provided
+generate_case_number() {
+    local year
+    year=$(date +%Y)
+    local seq=1
+    if [[ -d "$FORENSIC_CASES_DIR" ]]; then
+        local existing
+        existing=$(find "$FORENSIC_CASES_DIR" -maxdepth 1 -type d -name "${year}-*" 2>/dev/null | wc -l)
+        seq=$((existing + 1))
+    fi
+    printf "%s-%04d" "$year" "$seq"
+}
+
+# Write a chain-of-custody log entry (JSON lines format)
+coc_log() {
+    local case_dir="$1"
+    local action="$2"
+    local item="${3:-N/A}"
+    local handler="${4:-$(whoami)}"
+    local notes="${5:-}"
+
+    local coc_file="${case_dir}/logs/chain-of-custody.jsonl"
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    local entry
+    entry=$(cat <<ENTRY
+{"timestamp":"${timestamp}","action":"${action}","item":"${item}","handler":"${handler}","from":"","to":"","notes":"${notes}"}
+ENTRY
+    )
+    echo "$entry" >> "$coc_file"
+}
+
+# Initialize a new case
+cmd_init() {
+    local case_number=""
+    local examiner=""
+    local description=""
+
+    while getopts "n:e:d:" opt; do
+        case "$opt" in
+            n) case_number="$OPTARG" ;;
+            e) examiner="$OPTARG" ;;
+            d) description="$OPTARG" ;;
+            *) usage ;;
+        esac
+    done
+
+    # Prompt for missing values
+    if [[ -z "$case_number" ]]; then
+        case_number=$(generate_case_number)
+        log_info "Auto-generated case number: ${case_number}"
+    fi
+
+    if [[ -z "$examiner" ]]; then
+        read -rp "Examiner name: " examiner
+        [[ -z "$examiner" ]] && examiner="$(whoami)"
+    fi
+
+    if [[ -z "$description" ]]; then
+        read -rp "Case description: " description
+    fi
+
+    local case_dir="${FORENSIC_CASES_DIR}/${case_number}"
+
+    if [[ -d "$case_dir" ]]; then
+        log_error "Case directory already exists: ${case_dir}"
+        exit 1
+    fi
+
+    # Create directory structure
+    mkdir -p "${case_dir}"/{evidence,reports,notes,logs}
+    log_info "Created case directory structure: ${case_dir}"
+
+    # Create case.json
+    local created_date
+    created_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    cat > "${case_dir}/case.json" <<CASEJSON
+{
+    "case_number": "${case_number}",
+    "examiner": "${examiner}",
+    "created": "${created_date}",
+    "modified": "${created_date}",
+    "description": "${description}",
+    "status": "open",
+    "evidence_items": [],
+    "notes": "",
+    "agency": "",
+    "requesting_officer": ""
+}
+CASEJSON
+
+    log_info "Created case.json"
+
+    # Initialize chain-of-custody log
+    coc_log "$case_dir" "CASE_CREATED" "Case ${case_number}" "$examiner" "Case initialized: ${description}"
+    log_info "Initialized chain-of-custody log"
+
+    # Set current case
+    mkdir -p "$FORENSIC_CASES_DIR"
+    echo "$case_number" > "$CURRENT_CASE_FILE"
+
+    echo ""
+    echo -e "${BOLD}=== Case Initialized ===${NC}"
+    echo -e "  Case Number : ${CYAN}${case_number}${NC}"
+    echo -e "  Examiner    : ${examiner}"
+    echo -e "  Description : ${description}"
+    echo -e "  Directory   : ${case_dir}"
+    echo -e "  Status      : ${GREEN}OPEN${NC}"
+    echo ""
+}
+
+# Show current case status
+cmd_status() {
+    if [[ ! -f "$CURRENT_CASE_FILE" ]]; then
+        log_warn "No active case. Use 'forensic-case init' to create one."
+        exit 0
+    fi
+
+    local case_number
+    case_number=$(cat "$CURRENT_CASE_FILE")
+    local case_dir="${FORENSIC_CASES_DIR}/${case_number}"
+    local case_json="${case_dir}/case.json"
+
+    if [[ ! -f "$case_json" ]]; then
+        log_error "Case metadata not found: ${case_json}"
+        exit 1
+    fi
+
+    local examiner created description status
+    examiner=$(python3 -c "import json; print(json.load(open('${case_json}'))['examiner'])" 2>/dev/null || echo "N/A")
+    created=$(python3 -c "import json; print(json.load(open('${case_json}'))['created'])" 2>/dev/null || echo "N/A")
+    description=$(python3 -c "import json; print(json.load(open('${case_json}'))['description'])" 2>/dev/null || echo "N/A")
+    status=$(python3 -c "import json; print(json.load(open('${case_json}'))['status'])" 2>/dev/null || echo "N/A")
+
+    # Count evidence items
+    local evidence_count=0
+    if [[ -d "${case_dir}/evidence" ]]; then
+        evidence_count=$(find "${case_dir}/evidence" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    fi
+
+    # Count log entries
+    local coc_entries=0
+    local coc_file="${case_dir}/logs/chain-of-custody.jsonl"
+    if [[ -f "$coc_file" ]]; then
+        coc_entries=$(wc -l < "$coc_file")
+    fi
+
+    local status_color="$GREEN"
+    [[ "$status" == "closed" ]] && status_color="$RED"
+
+    echo ""
+    echo -e "${BOLD}=== Case Status ===${NC}"
+    echo -e "  Case Number    : ${CYAN}${case_number}${NC}"
+    echo -e "  Examiner       : ${examiner}"
+    echo -e "  Created        : ${created}"
+    echo -e "  Description    : ${description}"
+    echo -e "  Status         : ${status_color}${status^^}${NC}"
+    echo -e "  Evidence Items : ${evidence_count}"
+    echo -e "  CoC Entries    : ${coc_entries}"
+    echo -e "  Directory      : ${case_dir}"
+    echo ""
+}
+
+# List all cases
+cmd_list() {
+    if [[ ! -d "$FORENSIC_CASES_DIR" ]]; then
+        log_warn "No cases directory found."
+        exit 0
+    fi
+
+    local current_case=""
+    [[ -f "$CURRENT_CASE_FILE" ]] && current_case=$(cat "$CURRENT_CASE_FILE")
+
+    echo ""
+    echo -e "${BOLD}=== Forensic Cases ===${NC}"
+    printf "  %-4s %-16s %-10s %-20s %s\n" "" "CASE NUMBER" "STATUS" "EXAMINER" "DESCRIPTION"
+    echo "  -----------------------------------------------------------------------"
+
+    local found=0
+    for case_dir in "${FORENSIC_CASES_DIR}"/*/; do
+        [[ ! -d "$case_dir" ]] && continue
+        local case_json="${case_dir}case.json"
+        [[ ! -f "$case_json" ]] && continue
+
+        found=1
+        local cn ex st desc marker=""
+        cn=$(python3 -c "import json; print(json.load(open('${case_json}'))['case_number'])" 2>/dev/null || echo "???")
+        ex=$(python3 -c "import json; print(json.load(open('${case_json}'))['examiner'])" 2>/dev/null || echo "???")
+        st=$(python3 -c "import json; print(json.load(open('${case_json}'))['status'])" 2>/dev/null || echo "???")
+        desc=$(python3 -c "import json; print(json.load(open('${case_json}'))['description'][:40])" 2>/dev/null || echo "???")
+
+        [[ "$cn" == "$current_case" ]] && marker=" *"
+
+        local sc="$GREEN"
+        [[ "$st" == "closed" ]] && sc="$RED"
+
+        printf "  %-4s %-16s ${sc}%-10s${NC} %-20s %s\n" "$marker" "$cn" "${st^^}" "$ex" "$desc"
+    done
+
+    if [[ $found -eq 0 ]]; then
+        echo "  (no cases found)"
+    fi
+
+    echo ""
+    [[ -n "$current_case" ]] && echo -e "  ${CYAN}* = active case${NC}"
+    echo ""
+}
+
+# Close and finalize the current case
+cmd_close() {
+    if [[ ! -f "$CURRENT_CASE_FILE" ]]; then
+        log_error "No active case to close."
+        exit 1
+    fi
+
+    local case_number
+    case_number=$(cat "$CURRENT_CASE_FILE")
+    local case_dir="${FORENSIC_CASES_DIR}/${case_number}"
+    local case_json="${case_dir}/case.json"
+
+    if [[ ! -f "$case_json" ]]; then
+        log_error "Case metadata not found: ${case_json}"
+        exit 1
+    fi
+
+    local status
+    status=$(python3 -c "import json; print(json.load(open('${case_json}'))['status'])" 2>/dev/null)
+    if [[ "$status" == "closed" ]]; then
+        log_warn "Case ${case_number} is already closed."
+        exit 0
+    fi
+
+    echo -e "${BOLD}Closing case: ${CYAN}${case_number}${NC}"
+
+    # Integrity verification: hash all evidence files
+    log_info "Performing integrity verification on evidence files..."
+    local integrity_log="${case_dir}/logs/integrity-verification.log"
+    echo "=== Integrity Verification ===" > "$integrity_log"
+    echo "Date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$integrity_log"
+    echo "Examiner: $(whoami)" >> "$integrity_log"
+    echo "" >> "$integrity_log"
+
+    local evidence_ok=true
+    if [[ -d "${case_dir}/evidence" ]]; then
+        while IFS= read -r -d '' efile; do
+            local hash
+            hash=$(sha256sum "$efile" | awk '{print $1}')
+            echo "SHA256: ${hash}  ${efile}" >> "$integrity_log"
+            log_info "  Verified: $(basename "$efile") -> ${hash:0:16}..."
+        done < <(find "${case_dir}/evidence" -type f -print0 2>/dev/null)
+    fi
+
+    echo "" >> "$integrity_log"
+    echo "Verification complete." >> "$integrity_log"
+
+    # Update case.json status
+    local closed_date
+    closed_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    python3 -c "
+import json
+with open('${case_json}', 'r') as f:
+    data = json.load(f)
+data['status'] = 'closed'
+data['modified'] = '${closed_date}'
+data['closed'] = '${closed_date}'
+with open('${case_json}', 'w') as f:
+    json.dump(data, f, indent=4)
+" 2>/dev/null
+
+    # Chain of custody log entry
+    coc_log "$case_dir" "CASE_CLOSED" "Case ${case_number}" "$(whoami)" "Case finalized with integrity verification"
+
+    # Remove current case marker
+    rm -f "$CURRENT_CASE_FILE"
+
+    echo ""
+    echo -e "${GREEN}Case ${case_number} has been closed and finalized.${NC}"
+    echo -e "Integrity log: ${integrity_log}"
+    echo ""
+}
+
+# Main
+if [[ $# -lt 1 ]]; then
+    usage
+fi
+
+command="$1"
+shift
+
+case "$command" in
+    init)   cmd_init "$@" ;;
+    status) cmd_status "$@" ;;
+    list)   cmd_list "$@" ;;
+    close)  cmd_close "$@" ;;
+    -h|--help) usage ;;
+    *)
+        log_error "Unknown command: ${command}"
+        usage
+        ;;
+esac

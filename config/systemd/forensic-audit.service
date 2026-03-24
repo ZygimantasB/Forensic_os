@@ -1,0 +1,68 @@
+[Unit]
+Description=ForensicOS Audit Logging Service
+Documentation=https://github.com/forensic-os/forensic-os
+After=local-fs.target syslog.target
+Wants=forensic-writeblock.service
+
+[Service]
+Type=simple
+
+# Ensure audit log exists with proper permissions
+ExecStartPre=/bin/bash -c '\
+    touch /var/log/forensic-audit.log; \
+    chmod 640 /var/log/forensic-audit.log; \
+    echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) AUDIT_SERVICE_START ForensicOS audit logging initialized" >> /var/log/forensic-audit.log'
+
+# Monitor all block device operations via udevadm and log them
+# Also tails the forensic audit log and forwards to syslog
+ExecStart=/bin/bash -c '\
+    # Start udevadm monitor for block events in background \
+    udevadm monitor --kernel --property --subsystem-match=block 2>/dev/null | \
+    while IFS= read -r line; do \
+        if echo "$line" | grep -qE "^(KERNEL|UDEV)"; then \
+            TIMESTAMP=$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ); \
+            echo "${TIMESTAMP} BLOCK_EVENT ${line}" >> /var/log/forensic-audit.log; \
+        fi; \
+    done & \
+    MONITOR_PID=$!; \
+    \
+    # Forward forensic audit log to syslog \
+    tail -n 0 -F /var/log/forensic-audit.log 2>/dev/null | \
+    while IFS= read -r logline; do \
+        logger -t forensic-audit "${logline}"; \
+    done & \
+    TAIL_PID=$!; \
+    \
+    # Periodic integrity check: verify write-block status every 60 seconds \
+    while true; do \
+        sleep 60; \
+        BOOT_DEV=$(findmnt -n -o SOURCE / | sed "s/[0-9]*$//"); \
+        for dev in /sys/block/sd* /sys/block/nvme*; do \
+            [ -e "$dev" ] || continue; \
+            DEVNAME="/dev/$(basename $dev)"; \
+            if [ "$DEVNAME" != "$BOOT_DEV" ]; then \
+                RO=$(cat "$dev/ro" 2>/dev/null || echo 1); \
+                if [ "$RO" = "0" ]; then \
+                    echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) AUDIT_WARNING $DEVNAME is NOT write-blocked!" >> /var/log/forensic-audit.log; \
+                    logger -t forensic-audit "WARNING: $DEVNAME is NOT write-blocked!"; \
+                fi; \
+            fi; \
+        done; \
+    done & \
+    CHECK_PID=$!; \
+    \
+    # Wait for any background process to exit \
+    trap "kill $MONITOR_PID $TAIL_PID $CHECK_PID 2>/dev/null; exit 0" SIGTERM SIGINT; \
+    wait'
+
+# Log service stop
+ExecStopPost=/bin/bash -c '\
+    echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) AUDIT_SERVICE_STOP ForensicOS audit logging stopped" >> /var/log/forensic-audit.log'
+
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
